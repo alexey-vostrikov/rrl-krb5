@@ -9,10 +9,18 @@ use crate::kdf::{self, Enctype, KeyUse};
 use crate::profile;
 use rand::RngCore;
 use std::fmt;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// A Kerberos protocol key (long-term, session or sub-key).
-#[derive(Clone, PartialEq, Eq)]
+///
+/// The octets are zeroed when the key is dropped. A long-lived acceptor holds the keytab's keys
+/// for the life of the process, and a short-lived one holds session keys it derived from a
+/// ticket; either way the octets would otherwise stay in a freed allocation, readable by anything
+/// that gets the allocator to hand the page back. `zeroize` writes through a volatile store and a
+/// compiler fence, so the write is not optimised away as a dead store to memory about to be freed.
+#[derive(Clone, PartialEq, Eq, Zeroize, ZeroizeOnDrop)]
 pub struct Key {
+    #[zeroize(skip)]
     enctype: Enctype,
     bytes: Vec<u8>,
 }
@@ -268,5 +276,24 @@ mod tests {
         let k = Key::new(17, vec![0xAB; 16]).unwrap();
         let s = format!("{k:?}");
         assert!(s.contains("redacted") && !s.contains("171"));
+    }
+
+    /// The key's octets are wiped when it is dropped, and the compiler cannot elide the wipe.
+    ///
+    /// This is a compile-time assertion: it fails to build unless `Key` really implements
+    /// `ZeroizeOnDrop`. A test that inspected freed memory would be undefined behaviour, and a
+    /// test that only checked `needs_drop` would pass for a `Key` holding a plain `Vec<u8>` — the
+    /// deallocation alone makes that true, and says nothing about whether the bytes were cleared.
+    #[test]
+    fn a_key_is_zeroized_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<Key>();
+
+        // And the drop path actually runs: dropping a clone leaves the original intact, which is
+        // what a caller that keeps a long-term key around depends on.
+        let key = Key::new(18, vec![7u8; 32]).expect("a 32-octet key for enctype 18");
+        let copy = key.clone();
+        drop(copy);
+        assert_eq!(key.bytes(), &[7u8; 32]);
     }
 }

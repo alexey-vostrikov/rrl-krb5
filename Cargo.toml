@@ -25,6 +25,7 @@ crypto-bigint = { version = "0.7.5", optional = true, default-features = false, 
 p256 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
 p384 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
 p521 = { version = "0.14", optional = true, default-features = false, features = ["ecdh", "ecdsa"] }
+zeroize = { version = "1", features = ["derive"] }
 pbkdf2 = { version = "0.13", optional = true, default-features = false, features = ["hmac"] }
 des = { version = "0.9", optional = true }
 rc2 = { version = "0.9", optional = true }
