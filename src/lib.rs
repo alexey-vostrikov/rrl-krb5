@@ -120,6 +120,8 @@ pub mod ccache; // FILE: and DIR: credential caches, MIT format
 pub mod client;
 pub mod config; // krb5.conf: default realm, KDCs, [domain_realm]
 mod der;
+#[cfg(test)]
+mod differential; // every crypto function, against rrl-crypto, on the same inputs
 pub mod dns; // KDC discovery: URI and SRV records, stub resolver
 pub mod initiator;
 pub mod kadmin; // kadmind's kadm5 RPC protocol: what kadmin does
