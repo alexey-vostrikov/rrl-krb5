@@ -1,4 +1,4 @@
-//! ASN.1 DER, in the `rrl-krb` crate.
+//! ASN.1 DER, in the `rrl-krb-common` crate.
 //!
 //! The implementation lives there because the KDC that produces the tickets this crate accepts
 //! needs the same decoder. Two copies of a length encoder are two ways to disagree about the
@@ -9,4 +9,4 @@
 //! resolving here, and so that a `DerError` raised on one side is the same type the other side
 //! matches on.
 
-pub use rrl_krb::der::*;
+pub use rrl_krb_common::der::*;
