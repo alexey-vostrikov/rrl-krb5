@@ -203,10 +203,13 @@ mod tests {
 
     #[test]
     fn raw_reads_return_the_exact_encoding() {
-        let data = [0x30, 0x81, 0x03, 2, 1, 5, 4, 0];
+        // A minimal length on purpose: `0x81 0x03` would be BER, not DER, and the decoder here
+        // refuses it. What this test is about is that `next_raw` hands back the octets it
+        // consumed, so a signature computed over them stays checkable.
+        let data = [0x30, 0x03, 2, 1, 5, 4, 0];
         let mut r = Reader::new(&data);
         let (tag, content, raw) = r.next_raw().unwrap();
-        assert_eq!((tag, content, raw), (0x30, &data[3..6], &data[..6]));
+        assert_eq!((tag, content, raw), (0x30, &data[2..5], &data[..5]));
         assert_eq!(r.optional(der::INTEGER).unwrap(), None);
         assert_eq!(r.optional(der::OCTET_STRING).unwrap(), Some(&[][..]));
         r.done("test").unwrap();

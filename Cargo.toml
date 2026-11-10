@@ -30,6 +30,10 @@ pbkdf2 = { version = "0.13", optional = true, default-features = false, features
 des = { version = "0.9", optional = true }
 rc2 = { version = "0.9", optional = true }
 tokio = { version = "1.38", optional = true, default-features = false, features = ["net", "time", "io-util"] }
+# The DER layer and the RFC 4120 structures, shared with the KDC that produces what this crate
+# accepts. One decoder for the octets a checksum covers is the point: a second copy is a second
+# way to disagree with a peer about a ticket that is otherwise valid.
+rrl-krb = { git = "https://github.com/alexey-vostrikov/rrl-krb", branch = "main" }
 
 [features]
 # PKINIT (RFC 4556), anonymous PKINIT (RFC 8062) and ECDH/ECDSA (RFC 5349):
