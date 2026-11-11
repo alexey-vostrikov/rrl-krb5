@@ -648,13 +648,13 @@ impl<C: PerMessageCrypto> PerMessageTokens<C> {
         rrc: u16,
         confounder: Option<&[u8]>,
     ) -> Result<Vec<u8>, TokenError> {
-        if let Some(c) = confounder {
-            if c.len() != self.crypto.confounder_len() {
-                return Err(TokenError::BadConfounder {
-                    got: c.len(),
-                    want: self.crypto.confounder_len(),
-                });
-            }
+        if let Some(c) = confounder
+            && c.len() != self.crypto.confounder_len()
+        {
+            return Err(TokenError::BadConfounder {
+                got: c.len(),
+                want: self.crypto.confounder_len(),
+            });
         }
         let header = wrap_header(self.base_flags() | FLAG_SEALED, ec, rrc, seq);
         // seal_input(), in place.

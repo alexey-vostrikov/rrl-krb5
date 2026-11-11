@@ -234,7 +234,7 @@ fn aes_cbc(encrypt: bool, key: &[u8], iv: &[u8], input: &[u8]) -> Result<Vec<u8>
     if encrypt {
         let pad = 16 - data.len() % 16;
         data.extend(std::iter::repeat_n(pad as u8, pad));
-    } else if data.is_empty() || data.len() % 16 != 0 {
+    } else if data.is_empty() || !data.len().is_multiple_of(16) {
         return err("the ciphertext is not whole blocks");
     }
     let mut out = Vec::with_capacity(data.len());

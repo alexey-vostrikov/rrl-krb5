@@ -235,12 +235,12 @@ impl Kcm {
 
         // Optional, as in MIT's get_kdc_offset: failure means "none".
         let mut header = Vec::new();
-        if let Ok(off) = self.call(OP_GET_KDC_OFFSET, Some(name), &[]) {
-            if off.len() >= 4 {
-                let mut v = off[..4].to_vec();
-                v.extend_from_slice(&[0; 4]);
-                header.push((TAG_DELTATIME, v));
-            }
+        if let Ok(off) = self.call(OP_GET_KDC_OFFSET, Some(name), &[])
+            && off.len() >= 4
+        {
+            let mut v = off[..4].to_vec();
+            v.extend_from_slice(&[0; 4]);
+            header.push((TAG_DELTATIME, v));
         }
         Ok(CCache {
             principal,

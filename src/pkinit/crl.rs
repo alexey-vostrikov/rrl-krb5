@@ -305,10 +305,10 @@ fn check_cert(
         }
         // An authorityKeyIdentifier naming another key: some other
         // issuer's CRL (a re-keyed CA), not this one's.
-        if let (Some(a), Some(s)) = (&crl.akid, ski) {
-            if a.as_slice() != s {
-                continue;
-            }
+        if let (Some(a), Some(s)) = (&crl.akid, ski)
+            && a.as_slice() != s
+        {
+            continue;
         }
         let mut score = 0;
         if !crl.unhandled_critical {

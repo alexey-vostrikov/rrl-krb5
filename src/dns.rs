@@ -134,10 +134,10 @@ impl Resolver {
                     // glibc ignores a scope suffix it cannot use; so do we.
                     let addr = words.next().unwrap_or("");
                     let addr = addr.split('%').next().unwrap_or("");
-                    if let Ok(ip) = addr.parse::<IpAddr>() {
-                        if r.servers.len() < 3 {
-                            r.servers.push(SocketAddr::new(ip, 53));
-                        }
+                    if let Ok(ip) = addr.parse::<IpAddr>()
+                        && r.servers.len() < 3
+                    {
+                        r.servers.push(SocketAddr::new(ip, 53));
                     }
                 }
                 Some("options") => {

@@ -66,7 +66,7 @@
 /// nothing.
 pub fn n_fold(input: &[u8], out_bits: usize) -> Vec<u8> {
     assert!(
-        out_bits > 0 && out_bits % 8 == 0,
+        out_bits > 0 && out_bits.is_multiple_of(8),
         "n-fold output length must be a positive multiple of 8 bits, got {out_bits}"
     );
     assert!(
@@ -203,7 +203,7 @@ mod tests {
     use super::*;
 
     fn hex(s: &str) -> Vec<u8> {
-        assert!(s.len() % 2 == 0, "odd-length hex literal: {s}");
+        assert!(s.len().is_multiple_of(2), "odd-length hex literal: {s}");
         (0..s.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("bad hex literal"))

@@ -31,16 +31,16 @@ pub fn reply(data: &[u8]) {
         }
         5 => {
             // A name list, as list_principals reads it.
-            if r.i32().is_ok() {
-                if let Ok(n) = r.count(4) {
-                    for _ in 0..n {
-                        match r.nullstring() {
-                            Ok(Some(s)) => {
-                                let _ = parse_name(&s);
-                            }
-                            Ok(None) => {}
-                            Err(_) => break,
+            if r.i32().is_ok()
+                && let Ok(n) = r.count(4)
+            {
+                for _ in 0..n {
+                    match r.nullstring() {
+                        Ok(Some(s)) => {
+                            let _ = parse_name(&s);
                         }
+                        Ok(None) => {}
+                        Err(_) => break,
                     }
                 }
             }

@@ -10,15 +10,27 @@ on:
   workflow_dispatch:
 jobs:
   test:
-    strategy:
-      matrix:
-        toolchain: ["1.85", stable]
+    # One toolchain, and it is the one `rust-version` declares. There used to be a matrix of
+    # `1.85` and `stable`, and it could only ever be wrong: the dependencies this crate rests on
+    # (`rrl-crypto`, `rrl-krb-common`) declare `rust-version = "1.99.1"`, so the 1.85 leg failed
+    # before compiling anything, and cancel-on-failure took `stable` down with it — a red job that
+    # reported no test result at all. A second leg is the right shape once the crate has a floor
+    # it can test *and* a ceiling it supports; one pin is the honest shape while the floor is the
+    # compiler everything is built with.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.toolchain }}
+          toolchain: "1.99.1"
+      # The pin has to agree with the manifest, or the leg silently tests something the crate does
+      # not claim to support — which is exactly how the 1.85 leg survived as long as it did.
+      - name: The toolchain matches rust-version
+        run: |
+          declared=$(sed -n 's/^rust-version *= *"\(.*\)"/\1/p' Cargo.toml)
+          actual=$(rustc --version | cut -d' ' -f2)
+          echo "declared=$declared actual=$actual"
+          test "$declared" = "$actual"
       - run: cargo test
       - run: cargo test --features spake-nist
       - run: cargo test --features pkinit

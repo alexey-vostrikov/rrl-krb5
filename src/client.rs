@@ -613,10 +613,9 @@ impl ReqTimes {
             kdc_options & KDC_OPT_RENEWABLE != 0,
             self.rtime,
             creds.renew_till,
-        ) {
-            if r > rtime {
-                return modified("renewable end time");
-            }
+        ) && r > rtime
+        {
+            return modified("renewable end time");
         }
         Ok(())
     }
@@ -1765,13 +1764,13 @@ impl KdcClient {
             S4u::Proxy { evidence, .. } => Some(&evidence.client),
             S4u::User(_) => None,
         };
-        if let Some(want) = want_client {
-            if !same_principal(&rep.client, want) {
-                return protocol(format!(
-                    "TGS reply is for {}, not {want} (KRB5_KDCREP_MODIFIED)",
-                    rep.client
-                ));
-            }
+        if let Some(want) = want_client
+            && !same_principal(&rep.client, want)
+        {
+            return protocol(format!(
+                "TGS reply is for {}, not {want} (KRB5_KDCREP_MODIFIED)",
+                rep.client
+            ));
         }
         let ticket_server = rep.ticket_server.clone();
         let mut reply_padata = rep.padata.clone();

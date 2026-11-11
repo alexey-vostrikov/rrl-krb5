@@ -171,10 +171,10 @@ pub(crate) fn negotiate_group(e_data: &[u8], offered: DhGroup) -> Option<DhGroup
         let mut algs = Reader::new(value).seq().ok()?;
         while !algs.is_empty() {
             let (oid, params) = algs.alg_id().ok()?;
-            if let Some(g) = DhGroup::from_alg_id(oid, params) {
-                if g > offered {
-                    return Some(g);
-                }
+            if let Some(g) = DhGroup::from_alg_id(oid, params)
+                && g > offered
+            {
+                return Some(g);
             }
         }
     }

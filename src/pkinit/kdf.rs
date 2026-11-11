@@ -134,7 +134,7 @@ mod tests {
     /// octets become 8, the eighth gathering their low bits, all with odd
     /// parity.
     fn des3_random_to_key(r: &[u8]) -> Vec<u8> {
-        let odd = |b: u8| (b & 0xFE) | u8::from((b >> 1).count_ones() % 2 == 0);
+        let odd = |b: u8| (b & 0xFE) | u8::from((b >> 1).count_ones().is_multiple_of(2));
         r.chunks(7)
             .flat_map(|c| {
                 let mut k: Vec<u8> = c.to_vec();

@@ -7,6 +7,17 @@ may break the API).
 
 ## [Unreleased]
 
+### Changed
+
+- The minimum supported Rust version is 1.99.1, up from 1.85. The floor is
+  what the crate's own dependencies require: `rrl-crypto` and
+  `rrl-krb-common` declare `rust-version = "1.99.1"`, and cargo refuses to
+  build a dependency newer than the compiler before compiling anything.
+  The previous floor could not be tested — CI's 1.85 leg failed in
+  dependency resolution, so the job reported no test result at all — and
+  CI now runs one toolchain, the declared one, asserting that it matches
+  the manifest.
+
 ## [1.0.0] - 2026-10-16
 
 ### Added

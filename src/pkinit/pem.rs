@@ -45,7 +45,7 @@ fn base64(s: &str) -> Option<Vec<u8>> {
         _ => None,
     };
     let s = s.as_bytes();
-    if s.len() % 4 != 0 {
+    if !s.len().is_multiple_of(4) {
         return None;
     }
     let pad = s.iter().rev().take_while(|&&c| c == b'=').count();

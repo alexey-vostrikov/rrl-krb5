@@ -256,9 +256,16 @@ move to new major versions without a major version of this crate.
 
 ## Rust version and stability
 
-The minimum supported Rust version is 1.85 (`rust-version` in
+The minimum supported Rust version is 1.99.1 (`rust-version` in
 `Cargo.toml`, tested in CI). It is raised only in a minor release, noted
 in the changelog, and only to a version at least six months old.
+
+That floor is set by what the crate is built on rather than chosen: the
+cryptography and the wire layer (`rrl-crypto`, `rrl-krb-common`) declare
+1.99.1 themselves, and cargo refuses to build a dependency newer than the
+compiler before compiling anything. The declared version is therefore also
+the toolchain the crate is built and tested with, and CI asserts that the
+two agree.
 
 The crate follows [Semantic Versioning](https://semver.org/). Error
 enums, structs the crate returns, and option structs are

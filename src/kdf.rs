@@ -404,7 +404,7 @@ pub fn kdf_hmac_sha2(
     if k_bits == 0 {
         return Err(KdfError::KLengthZero);
     }
-    if k_bits % 8 != 0 {
+    if !k_bits.is_multiple_of(8) {
         return Err(KdfError::NotWholeOctets(k_bits));
     }
 

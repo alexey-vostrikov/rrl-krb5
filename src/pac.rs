@@ -509,8 +509,10 @@ impl Sid {
         }
         let authority = b[2..8].iter().fold(0u64, |a, &x| (a << 8) | x as u64);
         let subs = b[8..len]
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         Ok((
             Sid {
@@ -820,12 +822,14 @@ impl DelegationInfo {
 }
 
 fn utf16(b: &[u8]) -> Result<String> {
-    if b.len() % 2 != 0 {
+    if !b.len().is_multiple_of(2) {
         return malformed("UTF-16 string of odd length");
     }
     let units: Vec<u16> = b
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     String::from_utf16(&units).map_err(|_| PacError::Malformed("bad UTF-16".into()))
 }

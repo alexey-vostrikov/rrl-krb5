@@ -1018,13 +1018,13 @@ impl EncTicketPart {
                 self.endtime, now, tolerance_seconds
             )));
         }
-        if let Some(start) = self.starttime {
-            if now.saturating_add(tolerance_seconds) < start {
-                return Err(KerberosError::TicketNotValid(format!(
-                    "ticket not valid until {} (now {}, tolerance {}s)",
-                    start, now, tolerance_seconds
-                )));
-            }
+        if let Some(start) = self.starttime
+            && now.saturating_add(tolerance_seconds) < start
+        {
+            return Err(KerberosError::TicketNotValid(format!(
+                "ticket not valid until {} (now {}, tolerance {}s)",
+                start, now, tolerance_seconds
+            )));
         }
         Ok(())
     }

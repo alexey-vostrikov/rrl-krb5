@@ -385,8 +385,7 @@ fn cts_encrypt_in_place(cipher: &Aes, iv: &[u8; BLOCK_SIZE], buf: &mut [u8]) -> 
 
     // Ordinary CBC over every block but the last.
     let mut prev = *iv;
-    for b in buf[..(nb - 1) * BLOCK_SIZE].chunks_exact_mut(BLOCK_SIZE) {
-        let b: &mut [u8; BLOCK_SIZE] = b.try_into().expect("whole block");
+    for b in buf[..(nb - 1) * BLOCK_SIZE].as_chunks_mut::<BLOCK_SIZE>().0 {
         xor_into(b, &prev);
         cipher.encrypt_block(b);
         prev = *b;
@@ -446,7 +445,12 @@ fn cts_decrypt(cipher: &Aes, iv: &[u8; BLOCK_SIZE], ciphertext: &[u8]) -> Result
     // which `ciphertext` still holds.
     let body = (nb - 2) * BLOCK_SIZE;
     cipher.decrypt_blocks(&mut out[..body]);
-    for (i, b) in out[..body].chunks_exact_mut(BLOCK_SIZE).enumerate() {
+    for (i, b) in out[..body]
+        .as_chunks_mut::<BLOCK_SIZE>()
+        .0
+        .iter_mut()
+        .enumerate()
+    {
         let prev = match i {
             0 => &iv[..],
             _ => &ciphertext[(i - 1) * BLOCK_SIZE..i * BLOCK_SIZE],
@@ -791,7 +795,7 @@ mod tests {
 
     fn h(s: &str) -> Vec<u8> {
         let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-        assert!(s.len() % 2 == 0, "odd hex length");
+        assert!(s.len().is_multiple_of(2), "odd hex length");
         (0..s.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("bad hex"))

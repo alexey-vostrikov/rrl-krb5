@@ -340,10 +340,10 @@ impl SpnegoInitiator {
             // other choice is the acceptor's error (MIT treats both
             // Kerberos OIDs as one, for Samba).
             self.nego_done = true;
-            if let Some(m) = resp.supported_mech {
-                if !is_krb5(m) {
-                    return Err(bad("the acceptor chose a mechanism we did not offer".into()));
-                }
+            if let Some(m) = resp.supported_mech
+                && !is_krb5(m)
+            {
+                return Err(bad("the acceptor chose a mechanism we did not offer".into()));
             }
             match resp.response_token {
                 None if self.mech_complete => None,

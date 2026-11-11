@@ -237,7 +237,7 @@ fn cbc_decrypt<C: BlockCipherDecrypt>(
     iv: &[u8],
     data: &[u8],
 ) -> Result<Vec<u8>> {
-    if data.is_empty() || data.len() % block != 0 || iv.len() != block {
+    if data.is_empty() || !data.len().is_multiple_of(block) || iv.len() != block {
         return Err(Error::BadPassword);
     }
     let mut out = Vec::with_capacity(data.len());
