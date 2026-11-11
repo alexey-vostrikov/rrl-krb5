@@ -20,6 +20,7 @@ use crate::acceptor::Keytab;
 use crate::ccache::{CCache, CacheError, CacheName, same_principal};
 use std::collections::HashMap;
 
+pub mod address; // HostAddress (RFC 4120 §5.2.5): the addresses a forwarded ticket is bound to
 #[cfg(feature = "tokio")]
 mod async_client;
 mod fast;
@@ -370,6 +371,17 @@ impl Credentials {
     pub fn is_invalid(&self) -> bool {
         self.flags & TKT_FLG_INVALID != 0
     }
+
+    /// The first credential of a `KRB-CRED` carrying `ticket`, sealed with `key`.
+    ///
+    /// `key` is the peer's key — the acceptor's subkey in a GSS exchange (RFC 4121 §4.1.1), or any
+    /// key the two sides agreed on — and the encrypted part uses usage 14 (RFC 4120 §7.5.1). This is
+    /// what a forwarded credential is sent as: [`KdcClient::forwarded_creds`] builds one, and
+    /// [`crate::acceptor`] reads it back.
+    pub fn to_krb_cred(&self, key: &Key) -> Result<Vec<u8>> {
+        let (now, usec) = now();
+        krbcred::encode(self, key, now, usec)
+    }
 }
 
 /// RFC 6806 §11 PA-REQ-ENC-PA-REP: sent empty, returned in the encrypted
@@ -603,6 +615,27 @@ struct SaltInfo {
     etype: i32,
     salt: Option<Vec<u8>>,
     params: Option<[u8; 4]>,
+}
+
+/// The optional inputs of a TGS request that are not names or times: what S4U asks for, and the
+/// addresses a forwarded ticket is bound to.
+///
+/// Grouped because they travel together and are empty in the ordinary case, and because eight
+/// positional arguments to one function is a call site nobody can read — the two that matter here
+/// are both "additional evidence", which is what the RFC calls them.
+struct Extra<'a> {
+    s4u: &'a S4u<'a>,
+    addresses: &'a [address::HostAddress],
+}
+
+impl<'a> Extra<'a> {
+    /// A request with no S4U and no addresses: the ordinary case.
+    fn none() -> Self {
+        Self {
+            s4u: &S4u::None,
+            addresses: &[],
+        }
+    }
 }
 
 /// A client for one realm and its KDCs, which reaches other realms' KDCs
@@ -1382,6 +1415,73 @@ impl KdcClient {
         self.tgs(net, tgt, &me, KDC_OPT_FORWARDED).await
     }
 
+    /// A forwarded ticket for `host`, packaged as a `KRB-CRED` sealed with `session_key`.
+    ///
+    /// This is Heimdal's `krb5_get_forwarded_creds` (`lib/krb5/get_for_creds.c`): ask the KDC for
+    /// the TGT again with the FORWARDED option, bound to the target host's addresses, and hand the
+    /// result to the peer sealed in the key the session already has. The peer can then use it as if
+    /// it had logged in itself — from that one machine, which is the point of binding the addresses.
+    ///
+    /// # What differs from Heimdal, and why
+    ///
+    /// Heimdal omits the addresses when the *source* TGT carries none ("If the tickets that are
+    /// forwarded are address-less, the forwarded tickets will also be address-less"), with an
+    /// operator's `no-addresses` per-realm policy on top. `Credentials` here does not carry the
+    /// ticket's `caddr` — reading it needs the service key, which a client does not have — so this
+    /// function always binds the addresses of `host`. That is the stricter of the two answers: an
+    /// addressless forwarded ticket is usable from anywhere the network allows, and a bind to the
+    /// host is what the caller asked for by naming a host. The addressless case is available
+    /// through [`KdcClient::forwarded_tgt`], which sends no addresses at all.
+    ///
+    /// `host` may be a name or an address literal; with `[libdefaults] block_dns` set, only a
+    /// literal is accepted and a name is a refusal rather than a lookup.
+    pub fn forwarded_creds(
+        &self,
+        tgt: &Credentials,
+        host: &str,
+        session_key: &Key,
+    ) -> Result<Vec<u8>> {
+        block_on(self.forwarded_creds_on(&Blocking, tgt, host, session_key, false))
+    }
+
+    /// [`Self::forwarded_creds`], taking MIT's `block_dns` from the caller instead of a
+    /// configuration file.
+    pub fn forwarded_creds_numeric(
+        &self,
+        tgt: &Credentials,
+        host: &str,
+        session_key: &Key,
+        numeric_only: bool,
+    ) -> Result<Vec<u8>> {
+        block_on(self.forwarded_creds_on(&Blocking, tgt, host, session_key, numeric_only))
+    }
+
+    pub(crate) async fn forwarded_creds_on<N: Net>(
+        &self,
+        net: &N,
+        tgt: &Credentials,
+        host: &str,
+        session_key: &Key,
+        numeric_only: bool,
+    ) -> Result<Vec<u8>> {
+        let addresses = address::of_host(host, numeric_only)?;
+        let realm = tgt_realm(tgt).to_string();
+        let reply = self
+            .tgs_ext(
+                net,
+                &realm,
+                tgt,
+                &Principal::krbtgt(&realm),
+                KDC_OPT_FORWARDED,
+                Extra {
+                    s4u: &S4u::None,
+                    addresses: &addresses,
+                },
+            )
+            .await?;
+        reply.creds.to_krb_cred(session_key)
+    }
+
     /// `creds` renewed (`kinit -R`, MIT's `krb5_get_renewed_creds`): a TGS
     /// request presenting the ticket itself with the RENEW option, to the
     /// KDC of the realm of its server. The new ticket has the old one's
@@ -1503,7 +1603,7 @@ impl KdcClient {
         server: &Principal,
         kdc_options: u32,
     ) -> Result<Credentials> {
-        self.tgs_ext(net, realm, tgt, server, kdc_options, &S4u::None)
+        self.tgs_ext(net, realm, tgt, server, kdc_options, Extra::none())
             .await
             .map(|r| r.creds)
     }
@@ -1517,8 +1617,9 @@ impl KdcClient {
         tgt: &Credentials,
         server: &Principal,
         kdc_options: u32,
-        s4u: &S4u<'_>,
+        extra: Extra<'_>,
     ) -> Result<TgsReply> {
+        let (s4u, addresses) = (extra.s4u, extra.addresses);
         let kdc = self.for_realm_with(net, realm).await?;
         let (now, usec) = now();
         let nonce = random_nonce();
@@ -1539,6 +1640,7 @@ impl KdcClient {
             &kdc.tgs_enctypes,
             kdc_options,
             evidence,
+            addresses,
         );
 
         // With FAST or S4U2Self, a subkey in the authenticator: it keys the
@@ -1793,6 +1895,7 @@ impl KdcClient {
                 &enctypes,
                 kdc_options,
                 None,
+                &[],
             );
             // A SPAKE response is keyed to this very request body.
             if let Some((value, k0)) = spake.respond(&body)? {
@@ -2191,7 +2294,16 @@ impl KdcClient {
         now: i64,
     ) -> Vec<u8> {
         let times = self.as_times(now);
-        self.req_body_with(cname, sname, nonce, &times, &self.tkt_enctypes, 0, None)
+        self.req_body_with(
+            cname,
+            sname,
+            nonce,
+            &times,
+            &self.tkt_enctypes,
+            0,
+            None,
+            &[],
+        )
     }
 
     /// The times an AS request asks for, as MIT's `set_request_times`
@@ -2230,6 +2342,7 @@ impl KdcClient {
         enctypes: &[i32],
         kdc_options: u32,
         additional_ticket: Option<&[u8]>,
+        addresses: &[address::HostAddress],
     ) -> Vec<u8> {
         let mut parts = vec![der::field(0, der::flags32(kdc_options))];
         if let Some(c) = cname {
@@ -2254,6 +2367,17 @@ impl KdcClient {
                     .collect::<Vec<_>>(),
             ),
         ));
+        // `addresses [9]`: the addresses the ticket is good for. A forwarded ticket names the host
+        // it is forwarded **to**, which is what keeps a delegated credential usable from one
+        // machine rather than from anywhere (RFC 4120 §5.2.5).
+        //
+        // [9], not [8]: field 8 is `etype` (RFC 4120 §5.4.1, and Heimdal `lib/asn1/krb5.asn1` is
+        // the second source). Writing the addresses into [8] produced a request whose address list
+        // the KDC read as an enctype list — a mistake that no test of the address encoding itself
+        // would show, only one that decodes the body it produced.
+        if !addresses.is_empty() {
+            parts.push(der::field(9, address::encode_caddr(addresses)));
+        }
         // additional-tickets [11]: the evidence ticket for S4U2Proxy.
         if let Some(t) = additional_ticket {
             parts.push(der::field(11, der::seq(&[t.to_vec()])));
@@ -2863,7 +2987,16 @@ mod tests {
             KDC_OPT_ALLOW_POSTDATE | KDC_OPT_POSTDATED | KDC_OPT_RENEWABLE
         );
         let alice = Principal::parse("alice@R").unwrap();
-        let body = c.req_body_with(Some(&alice), &Principal::krbtgt("R"), 1, &t, &[18], o, None);
+        let body = c.req_body_with(
+            Some(&alice),
+            &Principal::krbtgt("R"),
+            1,
+            &t,
+            &[18],
+            o,
+            None,
+            &[],
+        );
         let bf = Fields::parse_tagged("KDC-REQ-BODY", der::SEQUENCE, &body).unwrap();
         assert_eq!(bf.get(4).unwrap().time().unwrap(), now + 600);
         assert_eq!(bf.get(5).unwrap().time().unwrap(), now + 4200);

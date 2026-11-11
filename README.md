@@ -20,6 +20,11 @@ tickets without shelling out to `kinit`.
 - **User-to-user** — tickets in the session key of a server's TGT
   (RFC 4120 §2.9.2, `kvno --u2u`), for servers with no keytab: requested,
   accepted with the TGT, and kept in caches as MIT keeps them.
+- **Forwarded credentials** — `KdcClient::forwarded_creds` (Heimdal's
+  `krb5_get_forwarded_creds`): a forwarded TGT bound to the target host's
+  addresses (`HostAddress`, IANA types 20/24), delivered as a `KRB-CRED`
+  sealed under the peer's key, which is how `rlogind`, `rsh` and a
+  delegating service hand a login to another machine.
 - **KDC client** — AS exchange with a password or keytab, including
   PA-ENC-TIMESTAMP pre-authentication and ETYPE-INFO2 salts; TGS exchange
   for service tickets, in other realms too (RFC 6806 referrals and

@@ -203,7 +203,10 @@ impl KdcClient {
                 tgt,
                 &tgt.client,
                 KDC_OPT_CANONICALIZE,
-                &S4u::User(&user),
+                Extra {
+                    s4u: &S4u::User(&user),
+                    addresses: &[],
+                },
             )
             .await?;
         check_s4u2self_reply(reply, &user)
@@ -247,7 +250,10 @@ impl KdcClient {
                 tgt,
                 &target,
                 KDC_OPT_CNAME_IN_ADDL_TKT | KDC_OPT_CANONICALIZE,
-                &S4u::Proxy { evidence },
+                Extra {
+                    s4u: &S4u::Proxy { evidence },
+                    addresses: &[],
+                },
             )
             .await?;
         let got = &reply.creds.server;

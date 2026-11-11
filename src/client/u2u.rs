@@ -60,7 +60,10 @@ impl KdcClient {
             tgt,
             &server,
             KDC_OPT_ENC_TKT_IN_SKEY,
-            &S4u::UserToUser(server_tgt),
+            Extra {
+                s4u: &S4u::UserToUser(server_tgt),
+                addresses: &[],
+            },
         )
         .await
         .map(|r| r.creds)
