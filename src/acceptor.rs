@@ -2097,12 +2097,12 @@ impl KerberosContext {
         Self::accept_token_opts(TicketKey::Keytab(keytab), token, opts, current_time())
     }
 
-    /// As [`Self::accept_token_with`], for any [`KeytabSource`]: a `MEMORY:` store, an `ANY:` chain,
-    /// or a `FILE:` opened as a source.
+    /// As [`Self::accept_token_with`], for any [`KeytabSource`](crate::keytab::KeytabSource): a
+    /// `MEMORY:` store, an `ANY:` chain, or a `FILE:` opened as a source.
     ///
     /// The difference from a [`Keytab`] by value is that a source is read on every accept, so a
     /// daemon that replaces its keys — a keytab fetched at start-up, a rotation over a socket —
-    /// does not have to restart or rebuild anything. [`KeytabSource`]: crate::keytab::KeytabSource
+    /// does not have to restart or rebuild anything.
     pub fn accept_token_with_source(
         source: &dyn crate::keytab::KeytabSource,
         token: &[u8],

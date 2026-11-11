@@ -200,8 +200,8 @@ impl MemoryKeytab {
     }
 
     /// Replaces every entry. A daemon that receives a fresh keytab wholesale uses this rather than
-    /// [`KeytabSource::add`] per key: an entry that is gone from the new list must be gone from the
-    /// store, and adding without removing leaves the old kvno trusted.
+    /// writing the keys one at a time into the source: an entry that is gone from the new list must
+    /// be gone from the store, and adding without removing leaves the old kvno trusted.
     pub fn replace(&self, keys: Vec<ServiceKey>) {
         *self.store.write().unwrap_or_else(|e| e.into_inner()) = keys;
     }
