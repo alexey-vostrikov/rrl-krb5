@@ -39,9 +39,17 @@ use aes::{
     Aes128, Aes256,
     cipher::{BlockCipherEncrypt, KeyInit},
 };
-use sha1::{Digest, Sha1};
 
 mod pbkdf2;
+
+/// This crate's enctype as the crypto layer's.
+///
+/// The two enums carry the same four numbers, and this is the only place that knows it: a cast
+/// scattered through the file would be a place for the mapping to go wrong silently.
+fn layer_enctype(enctype: Enctype) -> Result<rrl_crypto::Enctype> {
+    rrl_crypto::Enctype::from_id(enctype.etype())
+        .ok_or(KdfError::UnsupportedEnctype(enctype.etype()))
+}
 
 /// AES cipher block size, in octets. RFC 3962 §6: `c = 16`.
 const AES_BLOCK: usize = 16;
@@ -396,7 +404,7 @@ pub fn kdf_hmac_sha2(
     if k_bits == 0 {
         return Err(KdfError::KLengthZero);
     }
-    if !k_bits.is_multiple_of(8) {
+    if k_bits % 8 != 0 {
         return Err(KdfError::NotWholeOctets(k_bits));
     }
 
@@ -483,27 +491,24 @@ pub fn derive_key(enctype: Enctype, base_key: &[u8], usage: u32, which: KeyUse) 
 /// Enctypes 17/18 have their own PRF, [`prf_simplified`]; [`prf`] picks
 /// the right one.
 pub fn prf_hmac_sha2(enctype: Enctype, input_key: &[u8], octet_string: &[u8]) -> Result<Vec<u8>> {
-    let k_bits = match enctype {
-        Enctype::Aes128CtsHmacSha256128 => 256,
-        Enctype::Aes256CtsHmacSha384192 => 384,
-        other => return Err(KdfError::NotAnRfc8009Enctype(other.etype())),
-    };
-    kdf_hmac_sha2(enctype, input_key, b"prf", Some(octet_string), k_bits)
+    if !enctype.is_rfc8009() {
+        return Err(KdfError::NotAnRfc8009Enctype(enctype.etype()));
+    }
+    // RFC 8009 3's KDF with the label "prf" and the message as context, in the crypto layer.
+    Ok(rrl_crypto::kdf::prf(
+        layer_enctype(enctype)?,
+        input_key,
+        octet_string,
+    )?)
 }
 
-/// RFC 3961 §5.3 simplified-profile PRF, for enctypes 17/18 (RFC 3962 §6).
+/// RFC 3961 §3 PRF for enctypes 17/18.
 ///
-/// ```text
-/// tmp1 = SHA-1(octet-string)
-/// tmp2 = truncate tmp1 to a multiple of the 16-octet block: 16 octets
-/// PRF  = E(DK(protocol-key, "prf"), tmp2, initial-cipher-state)
-/// ```
-///
-/// The output is one AES block, 16 octets for both key sizes. `E` is
-/// AES-CTS, which on exactly one block is a single AES encryption under
-/// the all-zero IV. The key is `DK(key, "prf")`, not the key itself, and
-/// the 3-octet constant is n-folded like every other DK constant.
+/// `DK(key, "prf")`, the first sixteen octets of SHA-1 over the message, one AES block through the
+/// all-zero IV. The key is `DK(key, "prf")`, not the key itself.
 pub fn prf_simplified(enctype: Enctype, input_key: &[u8], octet_string: &[u8]) -> Result<Vec<u8>> {
+    // Named refusals first: a caller matches on these, and they say which function belongs to which
+    // enctype rather than "wrong length".
     if enctype.is_rfc8009() {
         return Err(KdfError::UnsupportedEnctype(enctype.etype()));
     }
@@ -514,11 +519,13 @@ pub fn prf_simplified(enctype: Enctype, input_key: &[u8], octet_string: &[u8]) -
             want: enctype.key_size(),
         });
     }
-    let kp = dk(input_key, b"prf", enctype.key_size())?;
-    let mut block = [0u8; AES_BLOCK];
-    block.copy_from_slice(&Sha1::digest(octet_string)[..AES_BLOCK]);
-    aes_encrypt_block(&kp, &mut block)?;
-    Ok(block.to_vec())
+    // The computation is in the crypto layer (RRL-7.3), where the same function serves the SHA-2
+    // enctypes through its other branch.
+    Ok(rrl_crypto::kdf::prf(
+        layer_enctype(enctype)?,
+        input_key,
+        octet_string,
+    )?)
 }
 
 /// The enctype's `pseudo-random` function (RFC 3961 §3): [`prf_simplified`]
@@ -623,29 +630,19 @@ fn string_to_key_inner(
     params: Option<[u8; 4]>,
     allow_weak: bool,
 ) -> Result<Vec<u8>> {
+    // The iteration policy stays here: its refusals are typed variants of this crate's public
+    // error surface, and a caller matches on them.
     let iter = s2k_iterations(enctype, params, allow_weak)?;
-    let keylen = enctype.key_size();
-    let mut tkey = vec![0u8; keylen];
 
-    match enctype {
-        Enctype::Aes128CtsHmacSha196 | Enctype::Aes256CtsHmacSha196 => {
-            // RFC 3962 §4: PBKDF2's PRF is HMAC-SHA-1, over the bare salt.
-            pbkdf2::pbkdf2_hmac_sha1(passphrase, salt, iter, &mut tkey);
-            dk(&tkey, KERBEROS, keylen)
-        }
-        Enctype::Aes128CtsHmacSha256128 => {
-            let saltp = rfc8009_saltp(enctype, salt)?;
-            pbkdf2::pbkdf2_hmac_sha256(passphrase, &saltp, iter, &mut tkey);
-            kdf_hmac_sha2(enctype, &tkey, KERBEROS, None, keylen as u32 * 8)
-        }
-        Enctype::Aes256CtsHmacSha384192 => {
-            let saltp = rfc8009_saltp(enctype, salt)?;
-            pbkdf2::pbkdf2_hmac_sha384(passphrase, &saltp, iter, &mut tkey);
-            // keylen here is the AES key size (256 bits), NOT the 192 that
-            // Kc and Ki use. One "key length" constant cannot serve both.
-            kdf_hmac_sha2(enctype, &tkey, KERBEROS, None, keylen as u32 * 8)
-        }
-    }
+    // PBKDF2 with the enctype's PRF, the RFC 8009 salt prefix, and the final KDF with the constant
+    // "kerberos" - all of it in the crypto layer (RRL-7.3). The count travels back as the four
+    // octets RFC 3962 4 defines, so the same policy decides it on both sides of the boundary.
+    Ok(rrl_crypto::kdf::s2k_allow_weak(
+        layer_enctype(enctype)?,
+        passphrase,
+        salt,
+        Some(&iter.to_be_bytes()),
+    )?)
 }
 
 /// RFC 8009 §4 `saltp = enctype-name | 0x00 | salt`.
