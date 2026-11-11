@@ -45,6 +45,16 @@ use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::debug;
 pub use xrealm::MAX_HOPS;
+
+/// The first credential of a `KRB-CRED` (RFC 4120 §5.8), tried against each of `keys`.
+///
+/// The public door to the packing: a peer that receives a delegated credential — a service that
+/// took a forwarded ticket from [`KdcClient::forwarded_creds`], or an acceptor reading one out of a
+/// GSS authenticator — needs exactly this and nothing else. Enctype 0 in the encrypted part is read
+/// as plaintext, as RFC 6448 allows, because a peer may send one that way.
+pub fn decode_krb_cred(msg: &[u8], keys: &[&Key]) -> Result<Credentials> {
+    krbcred::decode(msg, keys)
+}
 use xrealm::{KDC_OPT_CANONICALIZE, NoStore, TgtStore, is_tgs, tgt_realm};
 
 #[cfg(feature = "pkinit")]
@@ -615,6 +625,25 @@ struct SaltInfo {
     etype: i32,
     salt: Option<Vec<u8>>,
     params: Option<[u8; 4]>,
+}
+
+/// Heimdal's address rule for a forwarded ticket, as one function so both branches can be tested
+/// without a KDC.
+///
+/// "If the tickets that are forwarded are address-less, the forwarded tickets will also be
+/// address-less" (`lib/krb5/get_for_creds.c`): an addressless source means the forwarded ticket is
+/// addressless too, **and the name is not resolved at all** — a host that does not resolve is not a
+/// failure when nothing needs its address. An addressed source means the forwarded ticket is bound
+/// to `host`, and then a name that does not resolve is a refusal.
+fn forwarded_addresses(
+    source: &[address::HostAddress],
+    host: &str,
+    numeric_only: bool,
+) -> Result<Vec<address::HostAddress>> {
+    if source.is_empty() {
+        return Ok(Vec::new());
+    }
+    address::of_host(host, numeric_only)
 }
 
 /// The optional inputs of a TGS request that are not names or times: what S4U asks for, and the
@@ -1415,62 +1444,76 @@ impl KdcClient {
         self.tgs(net, tgt, &me, KDC_OPT_FORWARDED).await
     }
 
-    /// A forwarded ticket for `host`, packaged as a `KRB-CRED` sealed with `session_key`.
+    /// A forwarded ticket for the TGT in `cache`, packaged as a `KRB-CRED` sealed with
+    /// `session_key`.
     ///
     /// This is Heimdal's `krb5_get_forwarded_creds` (`lib/krb5/get_for_creds.c`): ask the KDC for
-    /// the TGT again with the FORWARDED option, bound to the target host's addresses, and hand the
-    /// result to the peer sealed in the key the session already has. The peer can then use it as if
-    /// it had logged in itself — from that one machine, which is the point of binding the addresses.
+    /// the TGT again with the FORWARDED option and hand the result to the peer sealed in the key
+    /// the session already has. The peer can then use it as if it had logged in itself.
     ///
-    /// # What differs from Heimdal, and why
+    /// # Addresses
     ///
-    /// Heimdal omits the addresses when the *source* TGT carries none ("If the tickets that are
-    /// forwarded are address-less, the forwarded tickets will also be address-less"), with an
-    /// operator's `no-addresses` per-realm policy on top. `Credentials` here does not carry the
-    /// ticket's `caddr` — reading it needs the service key, which a client does not have — so this
-    /// function always binds the addresses of `host`. That is the stricter of the two answers: an
-    /// addressless forwarded ticket is usable from anywhere the network allows, and a bind to the
-    /// host is what the caller asked for by naming a host. The addressless case is available
-    /// through [`KdcClient::forwarded_tgt`], which sends no addresses at all.
+    /// Heimdal's rule, kept exactly: **a forwarded ticket inherits the address policy of the ticket
+    /// it was made from.** If the source TGT was issued without addresses, the forwarded one is
+    /// addressless too — there is nothing to inherit, and inventing a binding would narrow a
+    /// credential the realm deliberately left open. If it does carry addresses, `host` is resolved
+    /// and the forwarded ticket is bound to *that* machine's addresses, which is what makes a
+    /// delegated credential usable from one host rather than from anywhere.
+    ///
+    /// The source addresses come from `cache` ([`crate::ccache::CCache::addresses_of`]), which is
+    /// where Heimdal reads them too: the KDC repeats the ticket's `caddr` in the encrypted part of
+    /// its reply, and the client opens that with its own key. No service key is involved.
+    ///
+    /// The TGT must be **forwardable** — `kinit -f`, or [`KdcClient::with_forwardable`] — because a
+    /// forwarded ticket is made from it. A KDC that is not willing refuses with
+    /// `KDC_ERR_BADOPTION`; MIT's text for it is "TGT NOT FORWARDABLE", which is what the live stand
+    /// in this repository printed the first time it ran.
     ///
     /// `host` may be a name or an address literal; with `[libdefaults] block_dns` set, only a
     /// literal is accepted and a name is a refusal rather than a lookup.
     pub fn forwarded_creds(
         &self,
-        tgt: &Credentials,
+        cache: &CacheName,
         host: &str,
         session_key: &Key,
     ) -> Result<Vec<u8>> {
-        block_on(self.forwarded_creds_on(&Blocking, tgt, host, session_key, false))
+        block_on(self.forwarded_creds_on(&Blocking, cache, host, session_key, false))
     }
 
-    /// [`Self::forwarded_creds`], taking MIT's `block_dns` from the caller instead of a
+    /// [`Self::forwarded_creds`], taking MIT's `block_dns` from the caller instead of from a
     /// configuration file.
     pub fn forwarded_creds_numeric(
         &self,
-        tgt: &Credentials,
+        cache: &CacheName,
         host: &str,
         session_key: &Key,
         numeric_only: bool,
     ) -> Result<Vec<u8>> {
-        block_on(self.forwarded_creds_on(&Blocking, tgt, host, session_key, numeric_only))
+        block_on(self.forwarded_creds_on(&Blocking, cache, host, session_key, numeric_only))
     }
 
     pub(crate) async fn forwarded_creds_on<N: Net>(
         &self,
         net: &N,
-        tgt: &Credentials,
+        cache: &CacheName,
         host: &str,
         session_key: &Key,
         numeric_only: bool,
     ) -> Result<Vec<u8>> {
-        let addresses = address::of_host(host, numeric_only)?;
-        let realm = tgt_realm(tgt).to_string();
+        let (now, _) = now();
+        let cc = cache.read()?;
+        let tgt = cc.tgt(now).ok_or_else(|| ClientError::NoTgt {
+            principal: cc.principal.to_string(),
+            cache: cache.to_string(),
+        })?;
+        let source = cc.addresses_of(&tgt.server, now);
+        let addresses = forwarded_addresses(&source, host, numeric_only)?;
+        let realm = tgt_realm(&tgt).to_string();
         let reply = self
             .tgs_ext(
                 net,
                 &realm,
-                tgt,
+                &tgt,
                 &Principal::krbtgt(&realm),
                 KDC_OPT_FORWARDED,
                 Extra {
@@ -2912,6 +2955,35 @@ impl KdcRep {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
+
+    /// Heimdal's two branches, as one table. The property that matters most is the first: an
+    /// addressless source must not resolve the name at all, because `.invalid` never resolves and a
+    /// forwarded ticket from an addressless TGT is supposed to succeed anyway.
+    #[test]
+    fn a_forwarded_ticket_inherits_the_address_policy_of_its_source() {
+        use address::{ADDRTYPE_INET, HostAddress};
+        let source = [HostAddress::new(ADDRTYPE_INET, vec![192, 0, 2, 7])];
+
+        // Addressless source: no addresses, and no lookup — a name that cannot resolve is not an
+        // error here.
+        assert!(
+            forwarded_addresses(&[], "no-such-host.invalid", false)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Addressed source: bound to the host, so the lookup matters.
+        assert_eq!(
+            forwarded_addresses(&source, "192.0.2.9", false).unwrap(),
+            vec![HostAddress::new(ADDRTYPE_INET, vec![192, 0, 2, 9])]
+        );
+
+        // And with `block_dns`, a name where an address must go is a refusal, not a lookup.
+        let err = forwarded_addresses(&source, "localhost", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("block_dns"), "{err}");
+    }
 
     #[test]
     fn principals_parse_like_mit() {

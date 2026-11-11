@@ -681,6 +681,36 @@ impl CCache {
             .max_by_key(|c| c.endtime)
     }
 
+    /// The addresses of the cached ticket for `server`, as the KDC stated them when it issued it.
+    ///
+    /// Heimdal's `krb5_get_forwarded_creds` decides the address policy of a forwarded ticket by
+    /// asking the cache what the source ticket carries (`get_addresses` in `lib/krb5/get_for_creds.c`
+    /// reads `ticket->addresses`), and this is that question. The addresses are in the cache
+    /// because the KDC repeats `caddr` in the encrypted part of its reply, which the client opens
+    /// with its own key — no service key is involved at any point.
+    ///
+    /// An empty result means either "the ticket is addressless" or "there is no such ticket here",
+    /// and the caller that must tell those apart looks for the ticket first.
+    pub fn addresses_of(
+        &self,
+        server: &Principal,
+        now: i64,
+    ) -> Vec<crate::client::address::HostAddress> {
+        self.entries
+            .iter()
+            .filter(|e| !e.is_config() && !e.is_removed())
+            .filter(|e| {
+                same_principal(&e.server, server) && same_principal(&e.client, &self.principal)
+            })
+            .filter(|e| i64::from(e.endtime) > now)
+            .flat_map(|e| {
+                e.addresses.iter().map(|(t, a)| {
+                    crate::client::address::HostAddress::new(i32::from(*t), a.clone())
+                })
+            })
+            .collect()
+    }
+
     /// The default principal's ticket-granting ticket for `realm` (the
     /// `start_realm` config entry, else the principal's own realm), if it
     /// has one that is unexpired at `now`.
