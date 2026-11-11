@@ -94,7 +94,12 @@ tickets without shelling out to `kinit`.
 - **Credential caches** — MIT's `FILE:` format (versions 1-4), `DIR:`
   collections, and `KCM:` (sssd-kcm, the Fedora/RHEL default, or
   Heimdal's `kcm`, over its Unix socket), so tickets move both ways between this crate and
-  `kinit`, `klist`, `kvno` and other GSS programs. Default cache name as
+  `kinit`, `klist`, `kvno` and other GSS programs. `MEMORY:` keeps a cache
+  inside the process, shared by every holder of the name and gone when it is
+  destroyed; `API:` is a store the embedding program registers
+  (`ccache::CcacheStore`), which is Heimdal's `ssapi` without plugins. Every
+  type is reached through that one trait, and `kdestroy`'s job is
+  `CacheName::destroy`. Default cache name as
   MIT resolves it (`KRB5CCNAME`, `default_ccache_name`,
   `/tmp/krb5cc_%{uid}`).
 - **krb5.conf** — MIT's profile format, parsed as MIT does (includes,

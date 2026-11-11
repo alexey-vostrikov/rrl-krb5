@@ -26,9 +26,28 @@
 //!
 //! [`CacheName`] resolves names as MIT does: `KRB5CCNAME`, then
 //! `[libdefaults] default_ccache_name`, then `FILE:/tmp/krb5cc_%{uid}`.
-//! `FILE:`, `DIR:` and (on Unix) `KCM:` are supported; `KEYRING:`, `API:`
-//! and `MEMORY:` are refused with [`CacheError::UnsupportedType`]. See
-//! [`kcm`] for the KCM protocol and its limits.
+//! `FILE:`, `DIR:` and (on Unix) `KCM:` are supported; `MEMORY:` is a cache
+//! inside this process, and `API:` is a store the embedding program
+//! registers ([`CcacheStore`]), which is Heimdal's `ssapi` without the
+//! plugin machinery. `KEYRING:` is refused with [`CacheError::UnsupportedType`].
+//! See [`kcm`] for the KCM protocol and its limits.
+//!
+//! # Where a cache lives
+//!
+//! `read`, `write` and `destroy` do no I/O themselves: they resolve the name to a
+//! [`CcacheStore`] and let it answer. `FILE:`/`DIR:` are the paths they name, `MEMORY:`
+//! is a store inside the process, and `API:` is a store the embedding program
+//! registers — Heimdal's `ssapi` without the plugin machinery.
+//!
+//! # What is not implemented, and why
+//!
+//! Heimdal's `acache` (`lib/krb5/acache.c`) is a client for OS credential-cache daemons
+//! — MIT's CCAPI, reached over a socket or Mach IPC, which is what MIT calls `API:` on
+//! macOS and Windows. That is a second IPC protocol with its own server, and on the
+//! platform this crate is deployed on (Linux) `KCM:` already is the daemon-backed cache
+//! and is implemented here. So `acache` is a decision, not a gap: an embedder that has
+//! a daemon of its own registers a [`CcacheStore`] and gets the same thing through
+//! `API:` without a second protocol in the tree.
 
 use crate::client::{Credentials, Principal, decode_encrypted_data};
 use crate::config::Krb5Conf;
@@ -100,6 +119,216 @@ pub enum CacheError {
     /// A cache name (the first field) that does not parse, and why.
     #[error("bad credential cache name {0:?}: {1}")]
     BadName(String, String),
+    /// No cache of that name exists in a store that can only hold what it was given
+    /// (`MEMORY:`, `API:`). MIT answers `KRB5_CC_NOTFOUND`; a file store has no such
+    /// state, which is why this variant exists rather than a wrapped `io::Error`.
+    #[error("no credential cache {0}")]
+    NoSuchCache(String),
+    /// `API:<name>` was used and no store is registered under that name.
+    #[error("no credential cache store is registered for API:{name}{}", if known.is_empty() { String::new() } else { format!("; registered: {}", known.join(", ")) })]
+    NoSuchStore {
+        /// The name after `API:`.
+        name: String,
+        /// The names that are registered, for the message.
+        known: Vec<String>,
+    },
+    /// The cache cannot be removed at all — `KCM:` has no destroy in this crate.
+    #[error("cannot destroy {name}: {why}")]
+    NoDestroy {
+        /// The cache name.
+        name: String,
+        /// Why not.
+        why: String,
+    },
+}
+
+/// Where a credential cache actually lives: the one interface every cache type is reached through.
+///
+/// [`CacheName::read`], [`CacheName::write`] and [`CacheName::destroy`] do no I/O of their own; they
+/// resolve the name to a store (see [`CacheName::store`]) and let it answer. `FILE:` and `DIR:` are
+/// the paths they name, `MEMORY:` is a store inside the process, and `API:` is a store the embedding
+/// program registers — Heimdal's `ssapi` without the plugin machinery, which is how a program with
+/// its own key store (a daemon holding tickets in a table, a test) joins the cache system.
+///
+/// The methods are by name rather than by handle because a [`CacheName`] is a name: it is parsed
+/// from `KRB5CCNAME`, compared and printed, and nothing in this crate holds a cache open between two
+/// calls. A store that needs a session can key it on the name.
+///
+/// `load` returns `Option` so that "this store has no cache by that name" is a state a store can be
+/// in without an error: a `MEMORY:` or `API:` cache that was never written is absent, which is not a
+/// failure. A `FILE:` store, whose absence is an `io::Error` from the read, answers `Some` or the
+/// error — [`CacheName::read`] turns `None` into [`CacheError::NoSuchCache`].
+pub trait CcacheStore: Send + Sync {
+    /// The cache stored as `name`, or `None` when this store holds none.
+    fn load(&self, name: &str) -> Result<Option<CCache>>;
+
+    /// Replaces the cache stored as `name`.
+    fn store(&self, name: &str, cache: &CCache) -> Result<()>;
+
+    /// Removes the cache stored as `name`, returning whether one was there.
+    ///
+    /// A store that cannot remove has no way to say so other than an error, and returning `false`
+    /// would read as "there was nothing" — so the default refuses.
+    fn destroy(&self, name: &str) -> Result<bool> {
+        Err(CacheError::NoDestroy {
+            name: name.to_owned(),
+            why: format!("the store {} cannot remove caches", self.name()),
+        })
+    }
+
+    /// What to call this store in a log line or an error.
+    fn name(&self) -> &str;
+}
+
+/// The stores registered for `API:` names.
+fn api_registry()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<dyn CcacheStore>>> {
+    static REGISTRY: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<dyn CcacheStore>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Registers `store` under `name`, for `API:<name>`.
+///
+/// Registering the same name twice replaces the store, and the second registration is what a test
+/// wants: one process, two cases, one name.
+pub fn register_api_store(name: &str, store: std::sync::Arc<dyn CcacheStore>) {
+    api_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(name.to_owned(), store);
+}
+
+/// Unregisters the store called `name`, returning whether one was there.
+pub fn unregister_api_store(name: &str) -> bool {
+    api_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(name)
+        .is_some()
+}
+
+/// The store registered for `name`, or the error listing what is registered.
+fn api_store(name: &str) -> Result<std::sync::Arc<dyn CcacheStore>> {
+    let registry = api_registry().lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(store) = registry.get(name) {
+        return Ok(store.clone());
+    }
+    let mut known: Vec<&String> = registry.keys().collect();
+    known.sort();
+    Err(CacheError::NoSuchStore {
+        name: name.to_owned(),
+        known: known.into_iter().cloned().collect(),
+    })
+}
+
+/// The cache a `FILE:`, `DIR:` or `DIR::` name refers to, as a store.
+///
+/// It holds the *name* rather than a path, so a `DIR:` collection whose `primary` file changes
+/// between two calls is followed: resolving once would pin the cache to whichever member was current
+/// when the name was parsed.
+struct PathStore {
+    display: String,
+    cache: CacheName,
+}
+
+impl CcacheStore for PathStore {
+    fn load(&self, _name: &str) -> Result<Option<CCache>> {
+        // The cache's own name, not the argument: a path store answers for exactly one cache.
+        Ok(Some(CCache::read(self.cache.path()?)?))
+    }
+
+    fn store(&self, _name: &str, cache: &CCache) -> Result<()> {
+        cache.write(self.cache.path()?)
+    }
+
+    fn destroy(&self, _name: &str) -> Result<bool> {
+        let path = self.cache.path()?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(source) => Err(CacheError::Io { path, source }),
+        }
+    }
+
+    fn name(&self) -> &str {
+        &self.display
+    }
+}
+
+/// The `MEMORY:` caches of this process, keyed by the name after the colon.
+///
+/// Heimdal (`lib/krb5/mcache.c`) and MIT (`cc_memory.c`) reference-count a memory cache and free it
+/// when the last handle closes. A [`CacheName`] here is not a handle — it is a name that is parsed
+/// and compared — so there is no close to count, and an entry lives until it is destroyed or the
+/// process ends. The difference is named rather than hidden: a long-lived process that writes
+/// `MEMORY:tmp` repeatedly and never destroys it keeps one entry, overwritten each time, which is
+/// what a program that leaked one handle would see too.
+#[derive(Debug, Default)]
+pub struct MemoryStore {
+    entries: std::sync::Mutex<std::collections::HashMap<String, CCache>>,
+}
+
+impl MemoryStore {
+    /// An empty store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The names this store holds, sorted — what `klist -l` would show.
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+}
+
+impl CcacheStore for MemoryStore {
+    fn load(&self, name: &str) -> Result<Option<CCache>> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned())
+    }
+
+    fn store(&self, name: &str, cache: &CCache) -> Result<()> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name.to_owned(), cache.clone());
+        Ok(())
+    }
+
+    fn destroy(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .entries
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name)
+            .is_some())
+    }
+
+    fn name(&self) -> &str {
+        "MEMORY:"
+    }
+}
+
+/// The store behind every `MEMORY:` name: one per process, which is what makes two iterations of a
+/// program see the same cache.
+fn memory_store() -> std::sync::Arc<dyn CcacheStore> {
+    static STORE: std::sync::OnceLock<std::sync::Arc<MemoryStore>> = std::sync::OnceLock::new();
+    STORE
+        .get_or_init(|| std::sync::Arc::new(MemoryStore::new()))
+        .clone()
 }
 
 /// A result with a [`CacheError`].
@@ -769,6 +998,10 @@ pub enum CacheName {
     Dir(PathBuf),
     /// `DIR::dir/tktNAME`: one cache within a collection.
     DirMember(PathBuf),
+    /// `MEMORY:name`: a cache inside this process, gone when it is destroyed or the process ends.
+    Memory(String),
+    /// `API:name`: a store the embedding program registered; see [`CcacheStore`].
+    Api(String),
     /// `KCM:name`, or `KCM:` for the daemon's primary cache. `socket` is
     /// `None` when `kcm_socket = -` disables KCM.
     Kcm {
@@ -785,6 +1018,8 @@ impl fmt::Display for CacheName {
             CacheName::File(p) => write!(f, "FILE:{}", p.display()),
             CacheName::Dir(p) => write!(f, "DIR:{}", p.display()),
             CacheName::DirMember(p) => write!(f, "DIR::{}", p.display()),
+            CacheName::Memory(name) => write!(f, "MEMORY:{name}"),
+            CacheName::Api(name) => write!(f, "API:{name}"),
             CacheName::Kcm { name, .. } => write!(f, "KCM:{name}"),
         }
     }
@@ -823,6 +1058,8 @@ impl CacheName {
                 None if residual.is_empty() => Err(bad("empty directory")),
                 None => Ok(CacheName::Dir(PathBuf::from(residual))),
             },
+            "MEMORY" => Ok(CacheName::Memory(residual.to_string())),
+            "API" => Ok(CacheName::Api(residual.to_string())),
             #[cfg(unix)]
             "KCM" => Ok(CacheName::Kcm {
                 name: residual.to_string(),
@@ -888,7 +1125,9 @@ impl CacheName {
     pub fn path(&self) -> Result<PathBuf> {
         match self {
             CacheName::File(p) | CacheName::DirMember(p) => Ok(p.clone()),
-            CacheName::Kcm { .. } => Err(CacheError::NotAFile(self.to_string())),
+            CacheName::Memory(_) | CacheName::Api(_) | CacheName::Kcm { .. } => {
+                Err(CacheError::NotAFile(self.to_string()))
+            }
             CacheName::Dir(dir) => {
                 ensure_dir(dir)?;
                 let primary = dir.join("primary");
@@ -947,6 +1186,26 @@ impl CacheName {
         Ok(())
     }
 
+    /// The store this name resolves to: the one interface every cache type is read, written and
+    /// destroyed through.
+    ///
+    /// `KCM:` is the exception, and it is not arbitrary: a KCM operation is a request on a socket
+    /// that `kcm` opens, sends and closes, so the store would be a connection rather than a value.
+    /// Its arms stay in [`Self::read`], [`Self::write`] and [`Self::destroy`] and are marked.
+    pub fn store(&self) -> Result<std::sync::Arc<dyn CcacheStore>> {
+        match self {
+            CacheName::File(_) | CacheName::Dir(_) | CacheName::DirMember(_) => {
+                Ok(std::sync::Arc::new(PathStore {
+                    display: self.to_string(),
+                    cache: self.clone(),
+                }))
+            }
+            CacheName::Memory(_) => Ok(memory_store()),
+            CacheName::Api(name) => api_store(name),
+            CacheName::Kcm { .. } => Err(CacheError::NotAFile(self.to_string())),
+        }
+    }
+
     /// Read the cache this name refers to.
     pub fn read(&self) -> Result<CCache> {
         #[cfg(unix)]
@@ -956,7 +1215,10 @@ impl CacheName {
             };
             return self.kcm()?.read(&name);
         }
-        CCache::read(self.path()?)
+        let (store, key) = (self.store()?, self.key());
+        store
+            .load(&key)?
+            .ok_or_else(|| CacheError::NoSuchCache(self.to_string()))
     }
 
     /// Replace the cache this name refers to with `cache`.
@@ -968,7 +1230,38 @@ impl CacheName {
             };
             return self.kcm()?.write(&name, cache);
         }
-        cache.write(self.path()?)
+        let (store, key) = (self.store()?, self.key());
+        store.store(&key, cache)
+    }
+
+    /// The key a store files this cache under: the name after the prefix for `MEMORY:` and `API:`,
+    /// and the name itself for the path types, which answer for exactly one cache and ignore it.
+    fn key(&self) -> String {
+        match self {
+            CacheName::Memory(name) | CacheName::Api(name) | CacheName::Kcm { name, .. } => {
+                name.clone()
+            }
+            other => other.to_string(),
+        }
+    }
+
+    /// Remove the cache this name refers to, as `kdestroy` does.
+    ///
+    /// Returns whether there was one. `KCM:` has no destroy in this crate, and says so rather than
+    /// reporting success.
+    pub fn destroy(&self) -> Result<bool> {
+        #[cfg(unix)]
+        if let CacheName::Kcm { .. } = self {
+            return Err(CacheError::NoDestroy {
+                name: self.to_string(),
+                why:
+                    "destroying a cache over KCM needs the daemon's DESTROY operation, which this \
+                      crate does not implement"
+                        .into(),
+            });
+        }
+        let (store, key) = (self.store()?, self.key());
+        store.destroy(&key)
     }
 }
 
@@ -1480,6 +1773,10 @@ mod tests {
             p("FILE:rel:with:colons"),
             CacheName::File("rel:with:colons".into())
         );
+        assert_eq!(p("MEMORY:tmp"), CacheName::Memory("tmp".into()));
+        assert_eq!(p("MEMORY:tmp").to_string(), "MEMORY:tmp");
+        assert_eq!(p("API:daemon"), CacheName::Api("daemon".into()));
+        assert_eq!(p("API:daemon").to_string(), "API:daemon");
         assert_eq!(p("DIR:/run/cc"), CacheName::Dir("/run/cc".into()));
         assert_eq!(
             p("DIR::/run/cc/tktabc"),
@@ -1509,12 +1806,10 @@ mod tests {
             );
             assert!(matches!(p("KCM:x").path(), Err(CacheError::NotAFile(_))));
         }
-        for name in [
-            "KEYRING:persistent:1000",
-            "API:x",
-            "MEMORY:x",
-            "file:/tmp/x",
-        ] {
+        // `KEYRING:` is the one type this crate still refuses: it is a Linux kernel keyring, and
+        // the abstract names it stores under are not the MIT format. `file:` in lower case is a
+        // file whose *name* begins with `file:` — MIT's resolve is case-sensitive too.
+        for name in ["KEYRING:persistent:1000", "file:/tmp/x"] {
             assert!(
                 matches!(CacheName::parse(name), Err(CacheError::UnsupportedType(_))),
                 "{name}"
@@ -1634,5 +1929,291 @@ mod tests {
             CacheName::Dir(f).path(),
             Err(CacheError::Format { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod tests_stores {
+    use super::*;
+    use crate::client::Principal;
+
+    fn alice() -> Principal {
+        Principal::parse("alice@EXAMPLE.COM").unwrap()
+    }
+
+    /// A cache with one entry, so a round trip has something to lose.
+    fn cache(label: &str) -> CCache {
+        let mut c = CCache::new(alice());
+        c.header.push((1, label.as_bytes().to_vec()));
+        c
+    }
+
+    // ------------------------------------------------------------------ MEMORY:
+
+    #[test]
+    fn a_memory_cache_is_written_and_read_by_name() {
+        let name = CacheName::parse("MEMORY:round-trip-in-test").unwrap();
+        let written = cache("memory");
+        name.write(&written).unwrap();
+        let back = name.read().unwrap();
+        assert_eq!(back.header, written.header);
+        assert_eq!(back.principal, alice());
+        assert!(
+            name.destroy().unwrap(),
+            "destroy reports that there was a cache"
+        );
+    }
+
+    #[test]
+    fn two_memory_names_are_two_caches() {
+        let a = CacheName::parse("MEMORY:two-a-in-test").unwrap();
+        let b = CacheName::parse("MEMORY:two-b-in-test").unwrap();
+        a.write(&cache("a")).unwrap();
+        b.write(&cache("b")).unwrap();
+        assert_eq!(a.read().unwrap().header[0].1, b"a");
+        assert_eq!(b.read().unwrap().header[0].1, b"b");
+        a.destroy().unwrap();
+        b.destroy().unwrap();
+    }
+
+    #[test]
+    fn a_memory_cache_that_was_never_written_is_absent_not_an_empty_cache() {
+        // The distinction matters: an absent cache is `klist` saying "no credentials cache", an
+        // empty one is a cache a program can go on to fill.
+        let name = CacheName::parse("MEMORY:absent-in-test").unwrap();
+        match name.read() {
+            Err(CacheError::NoSuchCache(text)) => assert_eq!(text, "MEMORY:absent-in-test"),
+            other => panic!("expected NoSuchCache, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn destroying_a_memory_cache_twice_reports_the_second_time() {
+        let name = CacheName::parse("MEMORY:twice-in-test").unwrap();
+        name.write(&cache("once")).unwrap();
+        assert!(name.destroy().unwrap());
+        assert!(
+            !name.destroy().unwrap(),
+            "the second destroy finds nothing and must say so rather than succeed quietly"
+        );
+    }
+
+    #[test]
+    fn the_memory_store_lists_its_names() {
+        // `klist -l` over a memory store: the names are what a program shows the user.
+        let store = MemoryStore::new();
+        store.store("beta", &cache("b")).unwrap();
+        store.store("alpha", &cache("a")).unwrap();
+        assert_eq!(store.names(), vec!["alpha".to_owned(), "beta".to_owned()]);
+        assert!(store.destroy("alpha").unwrap());
+        assert_eq!(store.names(), vec!["beta".to_owned()]);
+    }
+
+    #[test]
+    fn a_memory_cache_is_seen_by_another_thread_of_the_process() {
+        // The reason `MEMORY:` is a process-wide store and not a value: two parts of one program
+        // — a worker that logs in, a thread that talks to a service — exchange tickets through the
+        // name alone, which is what Heimdal's refcounted table and MIT's hashtable are for. The
+        // test writes in one thread and reads in another, so a store that lived in a thread-local
+        // or in the value itself would fail it.
+        let name = "threads-in-test";
+        let writer = CacheName::parse(&format!("MEMORY:{name}")).unwrap();
+        let handle = std::thread::spawn(move || {
+            writer.write(&cache("from-the-other-thread")).unwrap();
+        });
+        handle.join().unwrap();
+
+        let reader = CacheName::parse(&format!("MEMORY:{name}")).unwrap();
+        assert_eq!(reader.read().unwrap().header[0].1, b"from-the-other-thread");
+        reader.destroy().unwrap();
+    }
+
+    #[test]
+    fn the_default_cache_name_from_krb5ccname_is_honoured() {
+        // `KRB5CCNAME=MEMORY:env` is how an operator switches a program to a memory cache without
+        // touching it, and it is the acceptance this store exists for.
+        let previous = std::env::var_os("KRB5CCNAME");
+        // SAFETY: the tests in this module that touch the environment are the only ones that do,
+        // and this section sets and restores it around a single-threaded block.
+        unsafe { std::env::set_var("KRB5CCNAME", "MEMORY:env-in-test") };
+        let name = CacheName::default(&Krb5Conf::empty()).unwrap();
+        name.write(&cache("env")).unwrap();
+        assert_eq!(name.read().unwrap().header[0].1, b"env");
+        name.destroy().unwrap();
+        unsafe {
+            match previous {
+                Some(v) => std::env::set_var("KRB5CCNAME", v),
+                None => std::env::remove_var("KRB5CCNAME"),
+            }
+        }
+    }
+
+    // --------------------------------------------------------------------- API:
+
+    /// A store the test supplies, as an embedding program supplies its own.
+    struct FakeStore {
+        name: String,
+        entries: std::sync::Mutex<std::collections::HashMap<String, CCache>>,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FakeStore {
+        fn new(name: &str) -> std::sync::Arc<Self> {
+            std::sync::Arc::new(Self {
+                name: name.to_owned(),
+                entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+                writes: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    impl CcacheStore for FakeStore {
+        fn load(&self, name: &str) -> Result<Option<CCache>> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(name)
+                .cloned())
+        }
+
+        fn store(&self, name: &str, cache: &CCache) -> Result<()> {
+            self.writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(name.to_owned(), cache.clone());
+            Ok(())
+        }
+
+        fn destroy(&self, name: &str) -> Result<bool> {
+            Ok(self
+                .entries
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(name)
+                .is_some())
+        }
+
+        fn name(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[test]
+    fn an_api_cache_goes_to_the_registered_store() {
+        let store = FakeStore::new("test-store");
+        register_api_store("in-test", store.clone());
+        let name = CacheName::parse("API:in-test").unwrap();
+
+        name.write(&cache("api")).unwrap();
+        assert_eq!(
+            store.writes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the write must reach the registered store, not a file"
+        );
+        assert_eq!(name.read().unwrap().header[0].1, b"api");
+        assert!(name.destroy().unwrap());
+        assert!(matches!(name.read(), Err(CacheError::NoSuchCache(_))));
+
+        unregister_api_store("in-test");
+    }
+
+    #[test]
+    fn an_api_name_with_no_store_says_what_is_registered() {
+        let known = FakeStore::new("listed");
+        register_api_store("listed-store-in-test", known);
+        let err = CacheName::parse("API:nobody-in-test")
+            .unwrap()
+            .read()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("listed-store-in-test"), "{err}");
+        unregister_api_store("listed-store-in-test");
+    }
+
+    #[test]
+    fn a_store_that_cannot_destroy_refuses_instead_of_reporting_success() {
+        // The default `destroy` on the trait: a store written for a system that only reads would
+        // otherwise answer "false", which reads as "there was nothing there".
+        struct ReadOnly;
+        impl CcacheStore for ReadOnly {
+            fn load(&self, _name: &str) -> Result<Option<CCache>> {
+                Ok(None)
+            }
+            fn store(&self, _name: &str, _cache: &CCache) -> Result<()> {
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "read-only-test"
+            }
+        }
+        register_api_store("read-only-in-test", std::sync::Arc::new(ReadOnly));
+        let err = CacheName::parse("API:read-only-in-test")
+            .unwrap()
+            .destroy()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("read-only-test") && err.contains("cannot remove"),
+            "{err}"
+        );
+        unregister_api_store("read-only-in-test");
+    }
+
+    // -------------------------------------------------------------------- FILE:
+
+    #[test]
+    fn a_file_cache_is_destroyed_by_unlinking_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "rrl-krb5-ccdestroy-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cc");
+        let name = CacheName::File(path.clone());
+        name.write(&cache("file")).unwrap();
+        assert!(path.exists());
+        assert!(name.destroy().unwrap());
+        assert!(!path.exists());
+        assert!(
+            !name.destroy().unwrap(),
+            "a second destroy finds nothing and says so"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_dir_member_is_destroyed_and_the_collection_stays() {
+        let dir = std::env::temp_dir().join(format!(
+            "rrl-krb5-dirdestroy-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("primary"), b"tkt\n").unwrap();
+        let member = CacheName::DirMember(dir.join("tkt"));
+        member.write(&cache("dir")).unwrap();
+        assert!(dir.join("tkt").exists());
+        assert!(member.destroy().unwrap());
+        assert!(!dir.join("tkt").exists());
+        assert!(
+            dir.join("primary").exists(),
+            "the collection and its primary file stay"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_kcm_cache_cannot_be_destroyed_here_and_says_why() {
+        let name = CacheName::Kcm {
+            name: "1000".into(),
+            socket: Some(PathBuf::from("/run/kcm.sock")),
+        };
+        let err = name.destroy().unwrap_err().to_string();
+        assert!(err.contains("DESTROY"), "{err}");
     }
 }
