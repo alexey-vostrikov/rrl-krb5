@@ -3,6 +3,14 @@
 #
 #   scripts/live.sh test --test kdc            # one test binary
 #   scripts/live.sh test                       # everything, live tests included
+#   KRB5_STAND=heimdal scripts/live.sh test --test heimdal_live
+#   scripts/live.sh clean                      # remove the image and the caches it filled
+#
+# One stand, two KDCs. `KRB5_STAND` picks which realm `scripts/live.sh` brings up inside the same
+# image: `mit` (the default) runs `scripts/test-kdc.sh`, `heimdal` runs `scripts/heimdal-realm.sh`,
+# which exists for PKINIT RSA key transport — the branch MIT does not implement. The image carries
+# both because a second image would be a second set of caches, a second thing to rebuild and a
+# second place for the fixtures to drift apart.
 #
 # Why a container: `scripts/test-kdc.sh` needs krb5kdc, kdb5_util and kadmin.local, and the gate
 # image (`scripts/image.sh`) has no KDC — by design, because it is the image every gate runs in.
@@ -17,6 +25,7 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 TAG=kdc-stand
+STAND=${KRB5_STAND:-mit}
 CACHE="${KRB5_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/rrl-krb5}"
 BASE_IMAGE="${KRB5_IMAGE:-rust:1.99.1-bullseye}"
 STAND_IMAGE="rrl-krb5-stand:${TAG}"
@@ -28,6 +37,15 @@ mkdir -p "$CACHE/rustup" "$CACHE/cargo-$TAG" "$ROOT/target"
 if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
   echo "building the gate image first ($BASE_IMAGE)" >&2
   "$ROOT/scripts/cargo.sh" --version >/dev/null
+fi
+
+if [ "${1:-}" = clean ]; then
+  # What this script leaves behind, by design: one image and two cache directories. Nothing else —
+  # the container is `--rm`, and the realm lives in its /tmp.
+  docker image rm "$STAND_IMAGE" 2>/dev/null || true
+  rm -rf "$CACHE/cargo-$TAG" "$CACHE/rustup-$TAG" "$ROOT/target/$TAG"
+  echo "removed $STAND_IMAGE and its caches" >&2
+  exit 0
 fi
 
 if ! docker image inspect "$STAND_IMAGE" >/dev/null 2>&1 \
@@ -59,6 +77,7 @@ exec docker run --rm \
   -e RUSTUP_HOME=/rustup \
   -e CARGO_TERM_COLOR=always \
   -e "KRB5_TEST_PASSWORD=${KRB5_TEST_PASSWORD:-alicepw}" \
+  -e "KRB5_STAND=$STAND" \
   -w /w \
   "$STAND_IMAGE" \
   sh -c '
@@ -68,7 +87,11 @@ exec docker run --rm \
     # The stand writes /tmp/kdc-stand; it must not be the KRB5_CONFIG from the image, which points
     # at a file that does not exist until the stand has run.
     unset KRB5_CONFIG
-    bash scripts/test-kdc.sh /tmp/kdc-stand >/dev/null
+    if [ "$KRB5_STAND" = heimdal ]; then
+      bash scripts/heimdal-realm.sh /tmp/kdc-stand >/dev/null
+    else
+      bash scripts/test-kdc.sh /tmp/kdc-stand >/dev/null
+    fi
     set -a
     . /tmp/kdc-stand/test.env
     set +a

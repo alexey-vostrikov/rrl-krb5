@@ -296,6 +296,29 @@ KRB5_CONFIG=/tmp/krb5test/krb5.conf scripts/mit-acceptor.py /tmp/krb5test target
 
 CI runs both on every push.
 
+Two more KDCs are reachable without installing anything on the host, through one image that is
+built on demand and removed on request:
+
+```sh
+scripts/live.sh test --test kdc                  # MIT KDC inside a container (Debian bullseye's 1.18)
+KRB5_STAND=heimdal scripts/live.sh test --test heimdal_live   # Heimdal 7.8.0, built from its tarball
+scripts/live.sh clean                            # remove the image and the caches it filled
+```
+
+`scripts/live.sh` starts the realm on loopback *inside* the container, publishes no port, and runs
+whatever cargo command it is given with the realm's environment; the container is `--rm`, so the
+realm goes away with it, and `clean` takes the image and the two cache directories. The Heimdal
+stand exists for one exchange MIT implements on neither side — PKINIT RSA key transport — and it
+found three differences between the CMS dialects that the crate had assumed away: Heimdal sends a
+bare `SignedData` where CMS asks for the content itself, signs with the `subjectKeyIdentifier`
+choice rather than `IssuerAndSerialNumber`, and uses SHA-1 whatever `supportedCMSTypes` the client
+offered. The `SignedData` it produced is kept as
+`src/pkinit/testdata/heimdal-rkey-signeddata.der` and pinned by a test.
+
+`KRB5_PKINIT_DUMP=<path>` writes the AuthPack this client sent and the PA-PK-AS-REP it got as
+`<path>.AuthPack` and `<path>.PA-PK-AS-REP`, and `KRB5_CMS_TRACE=1` prints how far the CMS parse
+got before refusing — the two things that made those differences findable rather than guessed.
+
 Every parser that reads what a peer sends has a libFuzzer target
 (`fuzz/`, see `fuzz/README.md`); the inputs they have crashed on are
 kept in `testdata/fuzz/` and replayed by `cargo test`, and CI runs each

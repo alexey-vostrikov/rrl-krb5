@@ -35,3 +35,26 @@ RUN apt-get update \
 # would on a host; nothing here listens on a privileged port.
 ENV KRB5_CONFIG=/tmp/kdc-stand/krb5.conf
 WORKDIR /w
+
+# Heimdal, built from its release tarball, for the one branch MIT has never implemented: PKINIT RSA
+# key transport (`encKeyPack`, RFC 4556 §3.2.3.2). One stand, two KDCs behind `KRB5_STAND`: adding
+# a second image would mean a second set of caches and a second thing to keep in step.
+#
+# 7.8.0 on purpose. It is the last release that takes the RSA branch without a switch
+# (`kdc/pkinit.c`: `else cp->keyex = USE_RSA;`); master 7.99.1 gates it behind
+# `[kdc] pkinit_allow_rsa_key_transport`, and a released tarball needs no autoreconf. The checksum
+# is pinned because the build fetches the source at image-build time and nothing else verifies it.
+ARG HEIMDAL_VERSION=7.8.0
+ARG HEIMDAL_SHA256=fd87a207846fa650fd377219adc4b8a8193e55904d8a752c2c3715b4155d8d38
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libtool bison flex texinfo ca-certificates curl \
+ && curl -fsSL -o /tmp/heimdal.tar.gz \
+      "https://github.com/heimdal/heimdal/releases/download/heimdal-${HEIMDAL_VERSION}/heimdal-${HEIMDAL_VERSION}.tar.gz" \
+ && echo "${HEIMDAL_SHA256}  /tmp/heimdal.tar.gz" | sha256sum -c - \
+ && tar xzf /tmp/heimdal.tar.gz -C /tmp \
+ && cd "/tmp/heimdal-${HEIMDAL_VERSION}" \
+ && ./configure --prefix=/opt/heimdal --sysconfdir=/opt/heimdal/etc --localstatedir=/var >/tmp/heimdal-configure.log 2>&1 \
+ && make -j"$(nproc)" >/tmp/heimdal-make.log 2>&1 \
+ && make install >/tmp/heimdal-install.log 2>&1 \
+ && rm -rf "/tmp/heimdal-${HEIMDAL_VERSION}" /tmp/heimdal.tar.gz /tmp/heimdal-*.log \
+ && /opt/heimdal/sbin/kdc --version | head -1
