@@ -674,8 +674,8 @@ pub fn rfc8009_saltp(enctype: Enctype, salt: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use crate::nfold::n_fold;
     use super::*;
+    use crate::nfold::n_fold;
 
     /// Decode hex as printed in an RFC (whitespace-separated octets).
     fn h(s: &str) -> Vec<u8> {
