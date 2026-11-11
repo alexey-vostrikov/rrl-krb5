@@ -39,13 +39,9 @@ use aes::{
     Aes128, Aes256,
     cipher::{BlockCipherEncrypt, KeyInit},
 };
-use hmac::{Hmac, Mac};
 use sha1::{Digest, Sha1};
-use sha2::{Sha256, Sha384};
 
 mod pbkdf2;
-
-use super::nfold::n_fold;
 
 /// AES cipher block size, in octets. RFC 3962 §6: `c = 16`.
 const AES_BLOCK: usize = 16;
@@ -118,6 +114,17 @@ pub enum KdfError {
 
     #[error("unknown or unsupported enctype {0}; only 17, 18, 19 and 20 are supported")]
     UnsupportedEnctype(i32),
+
+    /// A refusal from the crypto layer, with its own wording. The layer names the rule it applies,
+    /// and repeating that text here would be a second copy of it.
+    #[error("{0}")]
+    Layer(String),
+}
+
+impl From<rrl_crypto::Error> for KdfError {
+    fn from(err: rrl_crypto::Error) -> Self {
+        KdfError::Layer(err.to_string())
+    }
 }
 
 type Result<T> = std::result::Result<T, KdfError>;
@@ -299,36 +306,22 @@ fn aes_encrypt_block(key: &[u8], block: &mut [u8; AES_BLOCK]) -> Result<()> {
 ///    block — so it passes every aes128 test (k = 128 needs one block) and
 ///    only breaks on aes256.
 pub fn dr(base_key: &[u8], constant: &[u8], k: usize) -> Result<Vec<u8>> {
+    // The inputs this module refuses by name, before the layer sees them: these variants are part
+    // of this crate's public error surface and a caller matches on them.
     if base_key.len() != 16 && base_key.len() != 32 {
         return Err(KdfError::AesKeyLength(base_key.len()));
     }
-    // RFC 3961 §5.1: "The size of the Constant must not be larger than c,
-    // because reducing the length of the Constant by n-folding can cause
-    // collisions." The exactly-equal case is used as-is; it never arises in
-    // the simplified profile (the constant is 5 octets) but string-to-key
-    // hands us "kerberos", which is 8.
-    let mut block = [0u8; AES_BLOCK];
-    match constant.len() {
-        0 => return Err(KdfError::ConstantEmpty),
-        n if n > AES_BLOCK => return Err(KdfError::ConstantTooLong(n)),
-        n if n == AES_BLOCK => block.copy_from_slice(constant),
-        _ => {
-            let folded = n_fold(constant, AES_BLOCK * 8);
-            debug_assert_eq!(folded.len(), AES_BLOCK);
-            block.copy_from_slice(&folded);
-        }
+    if constant.is_empty() {
+        return Err(KdfError::ConstantEmpty);
+    }
+    if constant.len() > AES_BLOCK {
+        return Err(KdfError::ConstantTooLong(constant.len()));
     }
 
-    let mut out = Vec::with_capacity(k + AES_BLOCK);
-    // "while accumulated < k", not a fixed block count: aes256 needs two
-    // iterations, aes128 one, and stopping at one block for aes256 is the
-    // other half of the zero-IV trap above.
-    while out.len() < k {
-        aes_encrypt_block(base_key, &mut block)?;
-        out.extend_from_slice(&block);
-    }
-    out.truncate(k);
-    Ok(out)
+    // The derivation itself lives in the crypto layer (RRL-7.3): RFC 3961 5.1 is one function, and
+    // two copies of it are two answers waiting to disagree. This crate's own vectors - RFC 3962,
+    // RFC 8009 and MIT's - are what say the two agree.
+    Ok(rrl_crypto::kdf::dr(base_key, constant, k)?)
 }
 
 /// RFC 3961 §5.1 `DK(Key, Constant) = random-to-key(DR(Key, Constant))`.
@@ -403,39 +396,27 @@ pub fn kdf_hmac_sha2(
     if k_bits == 0 {
         return Err(KdfError::KLengthZero);
     }
-    if k_bits % 8 != 0 {
+    if !k_bits.is_multiple_of(8) {
         return Err(KdfError::NotWholeOctets(k_bits));
     }
-    let msg = kdf_message(label, context, k_bits);
-    let out = k_bits as usize / 8;
 
-    match enctype {
-        Enctype::Aes128CtsHmacSha256128 => {
-            if k_bits > 256 {
-                return Err(KdfError::KLengthTooLong {
-                    want: k_bits,
-                    max: 256,
-                });
-            }
-            let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
-                .expect("HMAC accepts any key length");
-            mac.update(&msg);
-            Ok(mac.finalize().into_bytes()[..out].to_vec())
-        }
-        Enctype::Aes256CtsHmacSha384192 => {
-            if k_bits > 384 {
-                return Err(KdfError::KLengthTooLong {
-                    want: k_bits,
-                    max: 384,
-                });
-            }
-            let mut mac = <Hmac<Sha384> as KeyInit>::new_from_slice(key)
-                .expect("HMAC accepts any key length");
-            mac.update(&msg);
-            Ok(mac.finalize().into_bytes()[..out].to_vec())
-        }
-        other => Err(KdfError::NotAnRfc8009Enctype(other.etype())),
+    // The per-enctype cap stays here: it is a typed refusal a caller matches on, and the layer
+    // applies one blanket limit instead because it does not know which enctype the caller means.
+    let (kind, max) = match enctype {
+        Enctype::Aes128CtsHmacSha256128 => (rrl_crypto::kdf::Sha2Kind::Sha256, 256),
+        Enctype::Aes256CtsHmacSha384192 => (rrl_crypto::kdf::Sha2Kind::Sha384, 384),
+        other => return Err(KdfError::NotAnRfc8009Enctype(other.etype())),
+    };
+    if k_bits > max {
+        return Err(KdfError::KLengthTooLong { want: k_bits, max });
     }
+
+    // The counter-mode HMAC and its framing live in the crypto layer (RRL-7.3): RFC 8009 3 is one
+    // function, and the framing - counter, label, separator, context, length - is exactly where two
+    // copies drift apart.
+    Ok(rrl_crypto::kdf::kdf_hmac_sha2(
+        kind, key, label, context, k_bits,
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -696,6 +677,7 @@ pub fn rfc8009_saltp(enctype: Enctype, salt: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::nfold::n_fold;
     use super::*;
 
     /// Decode hex as printed in an RFC (whitespace-separated octets).

@@ -13,6 +13,11 @@ categories = ["authentication", "cryptography", "network-programming"]
 exclude = ["/.github", "/fuzz"]
 
 [dependencies]
+# The family's crypto layer. RFC 3961 5.1 and RFC 8009 3 are one function each, and this crate used
+# to carry its own copy of both; the copies are what `src/differential.rs` compares. Routing the
+# derivation through the layer is the step that retires the comparison for the functions that moved
+# - the vectors in `tests/` are what prove the move preserved behaviour.
+rrl-crypto = { git = "https://github.com/alexey-vostrikov/rrl-crypto", branch = "main" }
 aes = "0.9"
 chrono = { version = "0.4", default-features = false, features = ["clock", "alloc"] }
 hmac = "0.13"
@@ -51,9 +56,8 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dev-dependencies]
-# Only for the differential test in `src/differential.rs`: it runs every crypto function of this
-# crate and of `rrl-crypto` on the same inputs and compares the octets. The library itself does not
-# depend on it — the fork stays self-contained, and the test is what keeps the two copies honest.
+# The differential test in `src/differential.rs` runs every crypto function of this crate and of
+# `rrl-crypto` on the same inputs and compares the octets.
 rrl-crypto = { git = "https://github.com/alexey-vostrikov/rrl-crypto", branch = "main" }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 serde_json = "1.0"
