@@ -76,6 +76,14 @@ tickets without shelling out to `kinit`.
   your own (`kpasswd`), and RFC 3244 set-password for an administrator,
   to `kadmind` or Active Directory, with the server's reasons for a
   refusal.
+- **Keytab sources** — `FILE:` (MIT's format), `MEMORY:` (a store inside the
+  process, shared by every handle of that name and gone with the last of
+  them) and `ANY:` (a comma separated list searched in order), as
+  Heimdal's `krb5_kt_resolve` names them. `Keytab::open("ANY:…")` takes
+  the keys into the old type for every `&Keytab` API; `Keytab::resolve`
+  hands the live source to the acceptor, so a daemon that replaces its
+  keys does not rebuild anything. `KFIL:`/`AKF:` (AFS), `KDB:` and `API:`
+  are refused by name, with the reason.
 - **kuserok** — may this principal log in as this local user?
   Heimdal's `krb5_kuserok`: `~/.k5login` and `~/.k5login.d` (one
   principal per line, ownership and mode enforced, `k5login_authoritative`),

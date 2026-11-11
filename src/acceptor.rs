@@ -628,6 +628,10 @@ impl Default for AcceptOptions {
 #[derive(Clone, Copy)]
 enum TicketKey<'a> {
     Keytab(&'a Keytab),
+    /// Any other [`KeytabSource`]: a `MEMORY:` store that changes under the acceptor's feet, or an
+    /// `ANY:` chain. A `Keytab` by value is the common case and keeps its own arm, because the
+    /// borrow it needs is exactly the one the old signature had.
+    Source(&'a dyn crate::keytab::KeytabSource),
     Tgt(&'a crate::Credentials),
 }
 
@@ -2093,6 +2097,37 @@ impl KerberosContext {
         Self::accept_token_opts(TicketKey::Keytab(keytab), token, opts, current_time())
     }
 
+    /// As [`Self::accept_token_with`], for any [`KeytabSource`]: a `MEMORY:` store, an `ANY:` chain,
+    /// or a `FILE:` opened as a source.
+    ///
+    /// The difference from a [`Keytab`] by value is that a source is read on every accept, so a
+    /// daemon that replaces its keys — a keytab fetched at start-up, a rotation over a socket —
+    /// does not have to restart or rebuild anything. [`KeytabSource`]: crate::keytab::KeytabSource
+    pub fn accept_token_with_source(
+        source: &dyn crate::keytab::KeytabSource,
+        token: &[u8],
+        opts: &AcceptOptions,
+    ) -> Result<(Self, Vec<u8>)> {
+        Self::accept_token_opts(TicketKey::Source(source), token, opts, current_time())
+    }
+
+    /// As [`Self::accept_ap_req`], for any [`KeytabSource`].
+    ///
+    /// [`KeytabSource`]: crate::keytab::KeytabSource
+    pub fn accept_ap_req_with_source(
+        source: &dyn crate::keytab::KeytabSource,
+        ap_req: &[u8],
+        opts: &AcceptOptions,
+    ) -> Result<(Self, Vec<u8>)> {
+        Self::accept_ap_req_opts(
+            TicketKey::Source(source),
+            ap_req,
+            opts,
+            current_time(),
+            None,
+        )
+    }
+
     /// As [`Self::accept_token_with`], for a user-to-user ticket (RFC 4120
     /// §2.9.2): one the KDC encrypted in the session key of `tgt`, our own
     /// TGT, which the initiator got with [`KdcClient::user_to_user`]
@@ -2263,6 +2298,19 @@ impl KerberosContext {
                     ))
                 })
                 .map(std::borrow::Cow::Borrowed)?,
+            TicketKey::Source(source) => {
+                let key = source
+                    .find(&service_name, ticket.enc_part.enctype, ticket.enc_part.kvno)
+                    .ok_or_else(|| {
+                        KerberosError::PrincipalNotFound(format!(
+                            "{} with enctype {:?} in {}",
+                            service_name,
+                            ticket.enc_part.enctype,
+                            source.name()
+                        ))
+                    })?;
+                std::borrow::Cow::Owned(key)
+            }
             // User-to-user: the ticket is in our TGT's session key. As in
             // MIT's rd_req, the ticket names the server (an alias of the
             // TGT's client is allowed); decrypting it is the proof.

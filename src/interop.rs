@@ -295,3 +295,82 @@ fn the_same_tickets_at_the_same_instant_pass_under_a_wide_tolerance() {
     }
     assert!(checked >= 1, "no fixtures exercised");
 }
+
+/// The same real MIT ticket, accepted through a [`KeytabSource`] rather than a `Keytab` by value.
+///
+/// This is the wiring check for names like `MEMORY:` and `ANY:`: the source types are only worth
+/// anything if the acceptor reads them on the accept, and a test that exercised the sources on their
+/// own would pass even if nothing ever called them.
+///
+/// [`KeytabSource`]: crate::keytab::KeytabSource
+#[test]
+fn a_real_kdc_ticket_is_accepted_through_a_keytab_source() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/interop.keytab");
+    let chain = crate::keytab::resolve(&format!("ANY:FILE:{path}")).expect("the chain resolves");
+    let f = fixtures();
+    let mut checked = 0;
+    for (label, e) in f.as_object().unwrap() {
+        let ap_req = unhex(e["ap_req"].as_str().unwrap());
+        let opts = crate::acceptor::AcceptOptions {
+            max_skew_secs: SKEW,
+            replay_cache: Some(std::sync::Arc::new(crate::rcache::ReplayCache::new())),
+            ..Default::default()
+        };
+        let (ctx, ap_rep) =
+            KerberosContext::accept_token_with_source(chain.as_ref(), &ap_req, &opts)
+                .unwrap_or_else(|err| {
+                    panic!("etype {label}: accept through a source failed: {err}")
+                });
+        assert!(ctx.established, "etype {label}: context must establish");
+        assert!(
+            ap_rep.is_empty(),
+            "etype {label}: no mutual auth was asked for"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 4, "all four enctype fixtures must be exercised");
+}
+
+/// A `MEMORY:` store filled from the same file accepts the same ticket, and keeps accepting after
+/// the entries are replaced.
+///
+/// The store is read on every accept, which is the difference from a `Keytab` by value: a daemon
+/// that receives new keys does not rebuild anything, and the next ticket is decrypted with them.
+#[test]
+fn a_memory_store_accepts_a_real_kdc_ticket_and_follows_a_replacement() {
+    let name = format!("interop-{}", std::process::id());
+    let on_disk = keytab();
+    let store = crate::keytab::MemoryKeytab::open(&name);
+
+    let fixture = fixtures();
+    let (label, e) = fixture.as_object().unwrap().iter().next().unwrap();
+    let ap_req = unhex(e["ap_req"].as_str().unwrap());
+
+    let accept = |store: &crate::keytab::MemoryKeytab| {
+        let opts = crate::acceptor::AcceptOptions {
+            max_skew_secs: SKEW,
+            replay_cache: Some(std::sync::Arc::new(crate::rcache::ReplayCache::new())),
+            ..Default::default()
+        };
+        KerberosContext::accept_token_with_source(store, &ap_req, &opts)
+    };
+
+    // Empty: the same ticket must be refused, which is what makes the accept below mean something.
+    assert!(
+        accept(&store).is_err(),
+        "an empty store must not accept anything"
+    );
+
+    store.replace(on_disk.keys().to_vec());
+    let (ctx, _) = accept(&store)
+        .unwrap_or_else(|err| panic!("etype {label}: accept through MEMORY: failed: {err}"));
+    assert!(ctx.established);
+
+    // A replacement that drops the keys takes the acceptance away again, in the same process, with
+    // no handle reopened: that is the property a live source exists for.
+    store.replace(Vec::new());
+    assert!(
+        accept(&store).is_err(),
+        "a store that lost its keys must stop accepting"
+    );
+}
