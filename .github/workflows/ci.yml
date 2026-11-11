@@ -114,8 +114,15 @@ jobs:
           set -eu
           sudo -S -p '' apt-get update -qq
           for attempt in 1 2 3; do
+            # Timeouts, not patience: with the resolver answering nothing every fetch waits out
+            # apt's own default, which is minutes per file — three attempts cost half an hour and
+            # still fail. Fifteen seconds per request and no inner retry makes a dead mirror a
+            # one-minute verdict, which is what a retry loop is for.
             if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-                 -o Acquire::Retries=3 --fix-missing \
+                 -o Acquire::Retries=1 \
+                 -o Acquire::http::Timeout=15 \
+                 -o Acquire::https::Timeout=15 \
+                 --fix-missing \
                  krb5-kdc krb5-admin-server krb5-user krb5-pkinit krb5-otp python3-gssapi; then
               exit 0
             fi
