@@ -76,6 +76,13 @@ tickets without shelling out to `kinit`.
   your own (`kpasswd`), and RFC 3244 set-password for an administrator,
   to `kadmind` or Active Directory, with the server's reasons for a
   refusal.
+- **kuserok** — may this principal log in as this local user?
+  Heimdal's `krb5_kuserok`: `~/.k5login` and `~/.k5login.d` (one
+  principal per line, ownership and mode enforced, `k5login_authoritative`),
+  the `SIMPLE` rule (a one-component principal named like the user in a
+  local realm), a `SYSTEM-K5LOGIN:<dir>` directory of per-user files, and
+  `k5login_directory` for hosts with no local accounts. The rules run in
+  `[libdefaults] kuserok` order; a refusal says which rule refused and why.
 - **Credential caches** — MIT's `FILE:` format (versions 1-4), `DIR:`
   collections, and `KCM:` (sssd-kcm, the Fedora/RHEL default, or
   Heimdal's `kcm`, over its Unix socket), so tickets move both ways between this crate and

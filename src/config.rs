@@ -464,6 +464,47 @@ impl Krb5Conf {
         self.get(&["libdefaults", "client_aware_channel_bindings"])
             .is_some_and(conf_boolean)
     }
+
+    /// The realms this host counts as its own: `[libdefaults] default_realm` first, then every realm
+    /// named on the right-hand side of a `[domain_realm]` mapping, in file order and without
+    /// duplicates.
+    ///
+    /// This is the set `kuserok`'s `SIMPLE` rule needs (see [`crate::kuserok`]): a realm is local
+    /// when the host already treats it as the realm of a local name, which is exactly what
+    /// `default_realm` and `[domain_realm]` state. Heimdal derives it the other way round — from the
+    /// host's own domain and the reverse mapping — and the two agree whenever `[domain_realm]` maps
+    /// the host's domain to the realm, which is what every deployment does.
+    pub fn local_realms(&self) -> Vec<String> {
+        let mut realms: Vec<String> = Vec::new();
+        if let Some(realm) = self.default_realm() {
+            realms.push(realm.to_owned());
+        }
+        if let Some(section) = self.root.iter().find_map(|n| match &n.value {
+            Value::Section(children) if n.name == "domain_realm" => Some(children),
+            _ => None,
+        }) {
+            for node in section {
+                let Value::Relation(realm) = &node.value else {
+                    continue;
+                };
+                if !realms.contains(realm) {
+                    realms.push(realm.clone());
+                }
+            }
+        }
+        realms
+    }
+}
+
+/// MIT's profile boolean, for a value that was written but does not parse. `k5login_authoritative`
+/// has no default an operator can guess from a misspelling, so a value that is not a boolean is
+/// treated as "no" — the same answer MIT's `profile_get_boolean` failure path gives.
+pub(crate) fn parse_bool(v: &str) -> Option<bool> {
+    if conf_boolean(v) {
+        return Some(true);
+    }
+    let lowered = v.to_ascii_lowercase();
+    matches!(lowered.as_str(), "n" | "no" | "false" | "f" | "0" | "off").then_some(false)
 }
 
 /// MIT's profile `parse_int`: `strtol(value, &end, 10)` consuming the whole

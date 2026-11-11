@@ -128,6 +128,7 @@ pub mod kadmin; // kadmind's kadm5 RPC protocol: what kadmin does
 mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
 pub mod key;
 pub mod kpasswd; // password changes over the kpasswd protocol (RFC 3244)
+pub mod kuserok; // may this principal log in as this local user (Heimdal `krb5_kuserok`)
 mod md5; // RFC 1321 and HMAC-MD5: channel bindings, PAC signatures, MS-SFU
 mod net; // the sockets, blocking or tokio's
 mod nfold; // RFC 3961 §5.1 n-fold
