@@ -805,7 +805,14 @@ fn libdefaults_shape_the_tickets_the_kdc_issues() {
     // Defaults, for comparison: one day, not renewable, not forwardable.
     let plain = KdcClient::from_config(&conf_with(&e, ""), &e.realm).unwrap();
     let tgt = plain.login_with_password(&e.p("alice"), "alicepw").unwrap();
-    assert_eq!(tgt.endtime - tgt.starttime.unwrap_or(tgt.authtime), 86400);
+    // The same one-second tolerance as above, for the same reason: the request is built from our
+    // clock and the ticket's `starttime` comes from the KDC's. An exact comparison here failed a
+    // run on 8 639.
+    let life = tgt.endtime - tgt.starttime.unwrap_or(tgt.authtime);
+    assert!(
+        (86400 - 1..=86400).contains(&life),
+        "the default lifetime is one day, got {life}"
+    );
     assert_eq!(tgt.flags & (FORWARDABLE | RENEWABLE), 0);
     assert_eq!(tgt.renew_till, None);
 }
@@ -825,7 +832,17 @@ fn a_realm_subsection_of_libdefaults_wins() {
         .unwrap()
         .login_with_password(&e.p("alice"), "alicepw")
         .unwrap();
-    assert_eq!(tgt.endtime - tgt.starttime.unwrap_or(tgt.authtime), 45 * 60);
+    let life = tgt.endtime - tgt.starttime.unwrap_or(tgt.authtime);
+    assert!(
+        (45 * 60 - 1..=45 * 60).contains(&life),
+        "the realm's 45m must win over the general 5h, got {life}"
+    );
+    // And the general value was not used: the two differ by hours, so a tolerance of one second
+    // cannot hide the wrong answer.
+    assert!(
+        life < 3600,
+        "5h from the general section was used instead of the realm's 45m: {life}"
+    );
 }
 
 // ------------------------------------------------------------- transports
