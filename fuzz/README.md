@@ -23,10 +23,16 @@ are reached by encrypting the input in a known key first.
 ## Running
 
 ```sh
-cargo install cargo-fuzz
-fuzz/seed.py                        # seed fuzz/corpus/ from testdata/
-cargo +nightly fuzz run -O acceptor_token -- -max_total_time=600
+fuzz/seed.py                                    # seed fuzz/corpus/ from testdata/
+scripts/fuzz.sh run -O acceptor_token -- -max_total_time=600
 ```
+
+`scripts/fuzz.sh` runs inside `docker/fuzz.Dockerfile`, which carries the two things `cargo fuzz`
+needs and the shipped toolchain does not: a **nightly newer than the crate's `rust-version`**
+(`-Zsanitizer` is nightly-only, and a nightly from before 1.99.1 branched refuses to build
+`rrl-crypto` and `rrl-krb-common` at all) and `clang`, which builds libFuzzer's own C++ sources.
+It builds that image on first use, so `cargo install cargo-fuzz` is not a step a contributor runs by
+hand — and the compiler the corpus is measured against is the compiler the crate ships with.
 
 On macOS with only the Command Line Tools, libFuzzer's C++ needs the SDK:
 

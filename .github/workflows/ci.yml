@@ -55,20 +55,33 @@ jobs:
     # Every fuzz target (fuzz/README.md) for 30 s from the seeds in
     # testdata/: a target that no longer builds, or a shallow crash. The
     # crashes found so far are replayed by `cargo test` (testdata/fuzz/).
-    # Pinned, so a nightly regression is a deliberate upgrade.
+    #
+    # In an image, not on the runner's own toolchain, and that is the whole
+    # point of `docker/fuzz.Dockerfile`: `cargo fuzz` needs a nightly, and the
+    # nightly has to be *newer* than this crate's `rust-version` — `rrl-crypto`
+    # and `rrl-krb-common` declare 1.99.1, so a nightly from before that
+    # branched refuses to build them (`rustc 1.98.0-nightly is not supported
+    # by the following packages`). Bumping the pin alone would fix it today and
+    # break again on the next MSRV bump; the image asserts the ordering, so the
+    # failure is a build step naming both versions instead of a compile error
+    # in the middle of a fuzz target.
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      IMAGE: rust:1.99.1-bullseye
+      FUZZ_IMAGE: rrl-krb5-fuzz:bullseye
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: nightly-2026-06-05
-      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - name: Build the toolchain image
+        run: docker build -t "$IMAGE" -f docker/toolchain.Dockerfile .
+      - name: Build the fuzz image
+        run: docker build -t "$FUZZ_IMAGE" -f docker/fuzz.Dockerfile --build-arg "BASE=$IMAGE" .
+      # Python on the runner, because `seed.py` only writes the corpus.
       - run: fuzz/seed.py
-      - working-directory: fuzz
-        run: |
-          cargo +nightly-2026-06-05 fuzz build -O
-          for t in $(cargo +nightly-2026-06-05 fuzz list); do
-            cargo +nightly-2026-06-05 fuzz run -O "$t" -- -max_total_time=30 -rss_limit_mb=4096 -max_len=16384
+      - run: ./scripts/fuzz.sh build -O
+      - run: |
+          for t in $(./scripts/fuzz.sh list); do
+            ./scripts/fuzz.sh run -O "$t" -- -max_total_time=30 -rss_limit_mb=4096 -max_len=16384
           done
   live-kdc:
     # The client against a real MIT KDC, and its GSS tokens against MIT's
