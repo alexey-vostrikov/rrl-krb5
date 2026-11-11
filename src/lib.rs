@@ -120,7 +120,6 @@ pub mod ccache; // FILE: and DIR: credential caches, MIT format
 pub mod client;
 pub mod config; // krb5.conf: default realm, KDCs, [domain_realm]
 mod der;
-mod time; // calendar arithmetic for KerberosTime, no date library
 #[cfg(test)]
 mod differential; // every one of the above, against rrl-crypto, on the same inputs
 pub mod dns; // KDC discovery: URI and SRV records, stub resolver
