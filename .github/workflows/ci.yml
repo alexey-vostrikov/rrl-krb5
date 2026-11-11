@@ -3,6 +3,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Run by hand from the Actions tab or `gh workflow run CI`. This repository is a fork, and a
+  # fork's Actions are switched on after its first push — a commit pushed while they were off
+  # never gets a run of its own, and without this the only way to see a green build is to push
+  # another commit.
+  workflow_dispatch:
 jobs:
   test:
     strategy:
