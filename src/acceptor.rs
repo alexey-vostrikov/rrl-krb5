@@ -628,8 +628,8 @@ impl Default for AcceptOptions {
 #[derive(Clone, Copy)]
 enum TicketKey<'a> {
     Keytab(&'a Keytab),
-    /// Any other [`KeytabSource`]: a `MEMORY:` store that changes under the acceptor's feet, or an
-    /// `ANY:` chain. A `Keytab` by value is the common case and keeps its own arm, because the
+    /// Any other [`KeytabSource`](crate::keytab::KeytabSource): a `MEMORY:` store that changes
+    /// under the acceptor's feet, or an `ANY:` chain. A `Keytab` by value is the common case and keeps its own arm, because the
     /// borrow it needs is exactly the one the old signature had.
     Source(&'a dyn crate::keytab::KeytabSource),
     Tgt(&'a crate::Credentials),
