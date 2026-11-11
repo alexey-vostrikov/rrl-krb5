@@ -1185,6 +1185,17 @@ impl KdcClient {
         self
     }
 
+    /// Ask for the reply key by RSA key transport rather than by agreement (RFC 4556 §3.2.3.2):
+    /// the AuthPack carries no `clientPublicValue`, and the KDC makes the key and hands it over
+    /// encrypted in this client's certificate. Off by default, because neither MIT's nor Heimdal's
+    /// client has such an option — a KDC that only knows agreement would refuse. Read from
+    /// `krb5.conf` as `pkinit_rsa_key_transport`.
+    #[cfg(feature = "pkinit")]
+    pub fn with_pkinit_rsa_key_transport(mut self, yes: bool) -> Self {
+        self.pkinit.rsa_key_transport = yes;
+        self
+    }
+
     /// The key-exchange group to offer, as `pkinit_dh_min_bits` sets it:
     /// MODP group 14 by default, or 16, or ECDH on P-256, P-384 or P-521
     /// (which needs MIT 1.22's KDC or later). A KDC that wants a stronger

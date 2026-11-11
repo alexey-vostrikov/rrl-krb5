@@ -5,10 +5,13 @@ use super::asn1::{self, ReaderExt};
 use super::ec;
 use super::rsa;
 use crate::der::{DerError, Reader};
+use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 type Result<T> = std::result::Result<T, DerError>;
 
+/// `sha1WithRSAEncryption`: accepted for verification, never offered.
+const SHA1_WITH_RSA: &str = "1.2.840.113549.1.1.5";
 const SHA256_WITH_RSA: &str = "1.2.840.113549.1.1.11";
 const SHA384_WITH_RSA: &str = "1.2.840.113549.1.1.12";
 const SHA512_WITH_RSA: &str = "1.2.840.113549.1.1.13";
@@ -19,6 +22,10 @@ const ECDSA_WITH_SHA512: &str = "1.2.840.10045.4.3.4";
 /// The digests a signature may use. SHA-1 is not among them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Hash {
+    /// SHA-1 (RFC 3370). **Verification only**: Heimdal's KDC signs its PKINIT replies with it and
+    /// its `supportedCMSTypes` handling does not always take the client's preference. Nothing in
+    /// this crate signs with SHA-1 — [`SigAlg::ALL`], the list a client offers, has no SHA-1 entry.
+    Sha1,
     Sha256,
     Sha384,
     Sha512,
@@ -27,6 +34,7 @@ pub(crate) enum Hash {
 impl Hash {
     pub(crate) fn oid(self) -> &'static str {
         match self {
+            Hash::Sha1 => "1.3.14.3.2.26",
             Hash::Sha256 => "2.16.840.1.101.3.4.2.1",
             Hash::Sha384 => "2.16.840.1.101.3.4.2.2",
             Hash::Sha512 => "2.16.840.1.101.3.4.2.3",
@@ -34,13 +42,14 @@ impl Hash {
     }
 
     pub(crate) fn from_oid(oid: &[u8]) -> Option<Hash> {
-        [Hash::Sha256, Hash::Sha384, Hash::Sha512]
+        [Hash::Sha1, Hash::Sha256, Hash::Sha384, Hash::Sha512]
             .into_iter()
             .find(|h| asn1::oid(h.oid()) == oid)
     }
 
     pub(crate) fn digest(self, data: &[u8]) -> Vec<u8> {
         match self {
+            Hash::Sha1 => Sha1::digest(data).to_vec(),
             Hash::Sha256 => Sha256::digest(data).to_vec(),
             Hash::Sha384 => Sha384::digest(data).to_vec(),
             Hash::Sha512 => Sha512::digest(data).to_vec(),
@@ -68,16 +77,25 @@ impl SigAlg {
 
     pub(crate) fn oid(self) -> &'static str {
         match self {
+            SigAlg::Rsa(Hash::Sha1) => SHA1_WITH_RSA,
             SigAlg::Rsa(Hash::Sha256) => SHA256_WITH_RSA,
             SigAlg::Rsa(Hash::Sha384) => SHA384_WITH_RSA,
             SigAlg::Rsa(Hash::Sha512) => SHA512_WITH_RSA,
             SigAlg::Ecdsa(Hash::Sha256) => ECDSA_WITH_SHA256,
             SigAlg::Ecdsa(Hash::Sha384) => ECDSA_WITH_SHA384,
             SigAlg::Ecdsa(Hash::Sha512) => ECDSA_WITH_SHA512,
+            // No ECDSA-with-SHA-1 exists in PKINIT practice, and nothing here produces one.
+            SigAlg::Ecdsa(Hash::Sha1) => ECDSA_WITH_SHA256,
         }
     }
 
+    /// The algorithm an OID names, for **verification**. SHA-1 is here and not in [`SigAlg::ALL`]:
+    /// it is accepted from a peer whose KDC still signs with it (Heimdal 7.8 does), and never
+    /// offered — a client of this crate cannot be made to sign with SHA-1 through this type.
     pub(crate) fn from_oid(oid: &[u8]) -> Option<SigAlg> {
+        if oid == asn1::oid(SHA1_WITH_RSA) {
+            return Some(SigAlg::Rsa(Hash::Sha1));
+        }
         SigAlg::ALL.into_iter().find(|a| asn1::oid(a.oid()) == oid)
     }
 

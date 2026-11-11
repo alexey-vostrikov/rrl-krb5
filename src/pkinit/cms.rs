@@ -29,13 +29,23 @@ fn err<T>(msg: impl Into<String>) -> Result<T> {
     Err(DerError(msg.into()))
 }
 
+/// A step marker while tracing a SignedData nobody here wrote: `KRB5_CMS_TRACE` in the environment
+/// prints how far the parse got before it refused.
+fn trace(step: &str) {
+    if std::env::var_os("KRB5_CMS_TRACE").is_some() {
+        eprintln!("cms: {step}");
+    }
+}
+
 pub(crate) const ID_SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
 /// `id-pkinit-authData`: the AuthPack's content type.
 pub(crate) const ID_PKINIT_AUTH_DATA: &str = "1.3.6.1.5.2.3.1";
 /// `id-pkinit-DHKeyData`: the KDCDHKeyInfo's content type.
 pub(crate) const ID_PKINIT_DHKEY_DATA: &str = "1.3.6.1.5.2.3.2";
-/// `id-pkinit-rkeyData`: the ReplyKeyPack's content type, inside a transported key's SignedData.
-pub(crate) const ID_PKINIT_RKEY_DATA: &str = "1.3.6.1.5.2.3.4";
+/// `id-pkinit-rkeyData` (RFC 4556 §3.2.3.2): the ReplyKeyPack's content type, inside a transported
+/// key's SignedData. `1.3.6.1.5.2.3.4` is `id-pkinit-KPClientAuth`, an extended key usage, and
+/// Heimdal answered with `.3` — which is what the RFC says and this said wrong.
+pub(crate) const ID_PKINIT_RKEY_DATA: &str = "1.3.6.1.5.2.3.3";
 const ATTR_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
 const ATTR_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
 
@@ -277,6 +287,25 @@ pub(crate) struct Signer<'a> {
     pub(crate) certs: &'a [Cert],
 }
 
+/// The `SignedData` in `data`, which is either a `ContentInfo` of `id-signedData` — what MIT's KDC
+/// puts in `dhSignedData` — or the bare `SignedData` itself. The second is what CMS asks for when a
+/// SignedData is the *content* of an EnvelopedData (RFC 5652 §5.1: "the content is the value of the
+/// encapsulated content type"), and it is what Heimdal's KDC sends in `encKeyPack`; a verifier that
+/// knows only the first form interops with only one of the two KDCs.
+fn signed_data_content(data: &[u8]) -> Result<&[u8]> {
+    let mut outer = Reader::new(data);
+    let mut top = outer.seq()?;
+    let (tag, first) = top.next()?;
+    if tag != asn1::OID {
+        // The first field of a SignedData is its version, an INTEGER.
+        return Ok(data);
+    }
+    if first != asn1::oid(ID_SIGNED_DATA) {
+        return err("not a CMS SignedData");
+    }
+    top.expect(der::ctx(0))
+}
+
 /// A SignedData ContentInfo around `content`, signed with SHA-256 by
 /// `signer` over the contentType and messageDigest attributes, or with no
 /// signer at all (anonymous PKINIT, RFC 8062 §4.1).
@@ -355,21 +384,16 @@ pub(crate) fn verify(
     revocation: crl::Policy<'_>,
     now: i64,
 ) -> Result<Verified> {
-    let mut outer = Reader::new(data);
-    let mut ci = outer.seq()?;
-    outer.done("ContentInfo")?;
-    if ci.oid()? != asn1::oid(ID_SIGNED_DATA) {
-        return err("not a CMS SignedData");
-    }
-    let mut sd = Reader::new(ci.expect(der::ctx(0))?).seq()?;
-    ci.done("ContentInfo")?;
+    let mut sd = Reader::new(signed_data_content(data)?).seq()?;
 
     sd.int()?; // version
     sd.expect(asn1::SET)?; // digestAlgorithms: the SignerInfo names its own
+    trace("digestAlgorithms");
     let mut encap = sd.seq()?;
     if encap.oid()? != asn1::oid(content_type) {
         return err("SignedData carries the wrong content type");
     }
+    trace("eContentType");
     let content = Reader::new(encap.expect(der::ctx(0))?).octets()?.to_vec();
     encap.done("EncapsulatedContentInfo")?;
     let mut certs = Vec::new();
@@ -395,6 +419,7 @@ pub(crate) fn verify(
             }
         }
     }
+    trace("certificates and crls");
     let mut infos = Reader::new(sd.expect(asn1::SET)?);
     sd.done("SignedData")?;
     if infos.is_empty() {
@@ -405,11 +430,47 @@ pub(crate) fn verify(
         return err("SignedData with more than one signer");
     }
 
+    trace("signerInfos");
     si.int()?; // version
-    let mut sid = si.seq()?;
-    let issuer = sid.next_raw()?.2;
-    let serial = sid.expect(der::INTEGER)?;
-    sid.done("IssuerAndSerialNumber")?;
+    // `SignerIdentifier ::= CHOICE { issuerAndSerialNumber SEQUENCE, subjectKeyIdentifier [0] }`.
+    // Heimdal signs with the key identifier and MIT with the issuer and serial — both are legal,
+    // and a verifier that knows only one of them interops with only one of them.
+    let (sid_tag, sid) = si.next()?;
+    let signer_index = match sid_tag {
+        der::SEQUENCE => {
+            let mut sid = Reader::new(sid);
+            let issuer = sid.next_raw()?.2;
+            let serial = sid.expect(der::INTEGER)?;
+            sid.done("IssuerAndSerialNumber")?;
+            certs
+                .iter()
+                .position(|c| c.issuer == issuer && c.serial == serial)
+                .ok_or_else(|| {
+                    DerError("SignedData does not include the signer's certificate".into())
+                })?
+        }
+        // `SubjectKeyIdentifier ::= OCTET STRING`, and a `[0]` choice around it is written either
+        // implicitly (primitive, the content is the key) or, as Heimdal writes it, constructed
+        // with the OCTET STRING inside.
+        tag if tag == asn1::implicit(0) || tag == der::ctx(0) => {
+            let key = if tag == der::ctx(0) {
+                Reader::new(sid).octets()?
+            } else {
+                sid
+            };
+            match certs.iter().position(|c| c.subject_key_id() == Some(key)) {
+                Some(i) => i,
+                None => {
+                    return err(
+                        "SignedData does not include the certificate with the signer's key \
+                         identifier",
+                    );
+                }
+            }
+        }
+        _ => return err("unsupported SignerIdentifier in SignedData"),
+    };
+    trace("sid");
     let (digest_oid, _) = si.alg_id()?;
     let hash = Hash::from_oid(digest_oid)
         .ok_or_else(|| DerError("unsupported SignedData digest algorithm".into()))?;
@@ -428,6 +489,7 @@ pub(crate) fn verify(
     si.optional(der::ctx(1))?; // unsignedAttrs
     si.done("SignerInfo")?;
 
+    trace("SignerInfo");
     let mut content_type_ok = false;
     let mut digest_ok = false;
     let mut a = Reader::new(attrs);
@@ -450,10 +512,7 @@ pub(crate) fn verify(
         return err("SignedData's signed attributes do not match its content");
     }
 
-    let signer = certs
-        .iter()
-        .find(|c| c.issuer == issuer && c.serial == serial)
-        .ok_or_else(|| DerError("SignedData does not include the signer's certificate".into()))?;
+    let signer = &certs[signer_index];
     let signed = der::tlv(asn1::SET, attrs);
     let key = signer.public_key()?;
     // MIT's KDC before 1.22 labels ECDSA signatures sha256WithRSAEncryption;
@@ -575,6 +634,46 @@ pub(crate) mod tests {
         )
         .unwrap_err();
         assert!(e.0.contains("another certificate"), "{e}");
+    }
+
+    /// A `SignedData` Heimdal 7.8.0 put inside the `encKeyPack` it answered our PKINIT request
+    /// with, taken from a live run of `scripts/live.sh` (`KRB5_STAND=heimdal`). It is here because
+    /// it differs from ours in three ways at once, and each one was a refusal until it was handled:
+    ///
+    /// * it is a **bare** `SignedData`, not a `ContentInfo` around one — CMS asks for the value of
+    ///   the encapsulated type, which for `id-signedData` is the `SignedData` itself;
+    /// * its `SignerIdentifier` is the **subjectKeyIdentifier** choice, written constructed
+    ///   (`a0 16 04 14 …`), while MIT and this crate write `IssuerAndSerialNumber`;
+    /// * it is signed with **SHA-1** (`sha1WithRSAEncryption`), whatever `supportedCMSTypes` the
+    ///   client offered.
+    ///
+    /// The signature does not verify against this crate's test CA — the stand's CA signed it, with
+    /// dates of the run that made it — so the assertion is about how far the parse gets: an OID,
+    /// digest or identifier problem is reported before the chain is looked at, and a chain problem
+    /// is the one failure that says the structure was understood.
+    #[test]
+    fn a_signed_data_heimdal_wrote_is_understood() {
+        let e = verify(
+            include_bytes!("testdata/heimdal-rkey-signeddata.der"),
+            ID_PKINIT_RKEY_DATA,
+            &[fixture("ca")],
+            crl::Policy::default(),
+            NOW,
+        )
+        .expect_err("another trust anchor");
+        // The stand's certificates are dated by the run that made them, so this is the anchor or
+        // the clock; both come after the parse, which is the point.
+        assert!(e.0.contains("chain") || e.0.contains("anchor"), "{e}");
+        // And with the wrong content type it is refused earlier, which shows the OID was read.
+        let e = verify(
+            include_bytes!("testdata/heimdal-rkey-signeddata.der"),
+            ID_PKINIT_DHKEY_DATA,
+            &[fixture("ca")],
+            crl::Policy::default(),
+            NOW,
+        )
+        .expect_err("the wrong content type");
+        assert!(e.0.contains("wrong content type"), "{e}");
     }
 
     /// What this crate writes is what OpenSSL reads: the reverse of the test above, as a

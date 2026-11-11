@@ -626,6 +626,20 @@ pub(crate) struct RequestInput<'a> {
     pub(crate) rsa_key_transport: bool,
 }
 
+/// Write a PKINIT message next to the path `KRB5_PKINIT_DUMP` names, as `<path>.<what>`.
+///
+/// A PKINIT refusal is almost never readable from the error alone: "the KDC refused" says nothing
+/// about whether the AuthPack was wrong, the reply was, or a certificate was. With the two
+/// messages on disk, `openssl asn1parse -inform DER -in <path>.AuthPack` answers the first
+/// question and `asn1parse` on the reply the second — which is how the three Heimdal differences
+/// below were found. Off unless the variable is set, and best-effort: a dump that cannot be
+/// written must not change the outcome of a login.
+fn dump(what: &str, bytes: &[u8]) {
+    if let Ok(path) = std::env::var("KRB5_PKINIT_DUMP") {
+        let _ = std::fs::write(format!("{path}.{what}"), bytes);
+    }
+}
+
 /// The PA-PK-AS-REQ value for `input`, and the state to read the reply.
 ///
 /// ```text
@@ -692,6 +706,7 @@ pub(crate) fn request(input: &RequestInput<'_>) -> Result<(Vec<u8>, Request)> {
         ));
     }
     let auth_pack = der::seq(&fields);
+    dump("AuthPack", &auth_pack);
     let signed = match input.identity {
         Some(id) => cms::signed_data(
             cms::ID_PKINIT_AUTH_DATA,
@@ -751,6 +766,7 @@ impl Request {
     ///     subjectPublicKey [0] BIT STRING, nonce [1], dhKeyExpiration [2] OPTIONAL }
     /// ```
     pub(crate) fn reply_key(&self, r: &ReplyInput<'_>) -> Result<Key> {
+        dump("PA-PK-AS-REP", r.pa_value);
         let mut top = Reader::new(r.pa_value);
         let (tag, body) = top.next()?;
         top.done("PA-PK-AS-REP")?;
@@ -976,6 +992,25 @@ mod tests {
             group: DhGroup::Modp2048,
             rsa_key_transport: false,
         }
+    }
+
+    #[test]
+    fn dump_authpack_hex() {
+        let id = rsa_identity();
+        let inp = input(b"body", Some(&id));
+        let (pa, _) = request(&inp).unwrap();
+        let mut r = Reader::new(&pa).seq().unwrap();
+        let signed = r.expect(asn1::implicit(0)).unwrap();
+        let ap = cms::verify(
+            signed,
+            cms::ID_PKINIT_AUTH_DATA,
+            &[fixture("ca")],
+            crl::Policy::default(),
+            NOW,
+        )
+        .unwrap()
+        .content;
+        std::fs::write("target/authpack.der", &ap).unwrap();
     }
 
     /// The KDC's half of the exchange `req` opened: its public value (the

@@ -23,6 +23,7 @@ fn err<T>(msg: impl Into<String>) -> Result<T> {
 const BASIC_CONSTRAINTS: &str = "2.5.29.19";
 const KEY_USAGE: &str = "2.5.29.15";
 const EXT_KEY_USAGE: &str = "2.5.29.37";
+const SUBJECT_KEY_ID: &str = "2.5.29.14";
 const SUBJECT_ALT_NAME: &str = "2.5.29.17";
 /// Extensions that may be critical without failing the chain: the ones
 /// read here, and the key identifiers, which only help chain building.
@@ -31,7 +32,7 @@ const UNDERSTOOD: [&str; 6] = [
     KEY_USAGE,
     EXT_KEY_USAGE,
     SUBJECT_ALT_NAME,
-    "2.5.29.14", // subjectKeyIdentifier
+    SUBJECT_KEY_ID,
     "2.5.29.35", // authorityKeyIdentifier
 ];
 
@@ -222,6 +223,14 @@ impl Cert {
         Ok(Some(
             c.get(byte).is_some_and(|b| b & (0x80 >> (bit % 8)) != 0),
         ))
+    }
+
+    /// The subjectKeyIdentifier extension's key, if it has one: what a CMS
+    /// `SignerIdentifier` names the signer by when it uses the `[0]` choice.
+    pub(crate) fn subject_key_id(&self) -> Option<&[u8]> {
+        let e = self.extension(SUBJECT_KEY_ID)?;
+        let mut r = Reader::new(&e.value);
+        r.octets().ok()
     }
 
     /// Whether extendedKeyUsage lists `dotted`.
