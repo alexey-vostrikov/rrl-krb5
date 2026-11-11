@@ -4,7 +4,7 @@
 #   scripts/live.sh test --test kdc            # one test binary
 #   scripts/live.sh test                       # everything, live tests included
 #   KRB5_STAND=heimdal scripts/live.sh test --test heimdal_live
-#   scripts/live.sh clean                      # remove the image and the caches it filled
+#   scripts/live.sh clean                      # remove the image, its predecessors and the caches
 #
 # One stand, two KDCs. `KRB5_STAND` picks which realm `scripts/live.sh` brings up inside the same
 # image: `mit` (the default) runs `scripts/test-kdc.sh`, `heimdal` runs `scripts/heimdal-realm.sh`,
@@ -29,6 +29,9 @@ STAND=${KRB5_STAND:-mit}
 CACHE="${KRB5_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/rrl-krb5}"
 BASE_IMAGE="${KRB5_IMAGE:-rust:1.99.1-bullseye}"
 STAND_IMAGE="rrl-krb5-stand:${TAG}"
+# The label every image built from `docker/kdc-stand.Dockerfile` carries, so that `clean` can find
+# the ones a rebuild left behind.
+STAND_LABEL="rrl-krb5.stand=kdc"
 
 mkdir -p "$CACHE/rustup" "$CACHE/cargo-$TAG" "$ROOT/target"
 
@@ -40,11 +43,21 @@ if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
 fi
 
 if [ "${1:-}" = clean ]; then
-  # What this script leaves behind, by design: one image and two cache directories. Nothing else —
-  # the container is `--rm`, and the realm lives in its /tmp.
+  # What this script leaves behind, by design: one image, its cargo cache and its target directory.
+  # Nothing else — the container is `--rm`, and the realm lives in its /tmp.
+  #
+  # The image is removed by **label**, not by tag, and then pruned: every rebuild retags
+  # `$STAND_IMAGE` and leaves the previous 2.6 GB image untagged and unreferenced, so removing the
+  # tag alone reclaims the newest one and keeps the debris of every build before it. The label is
+  # in the Dockerfile, so a hand-built copy carries it too.
   docker image rm "$STAND_IMAGE" 2>/dev/null || true
-  rm -rf "$CACHE/cargo-$TAG" "$CACHE/rustup-$TAG" "$ROOT/target/$TAG"
-  echo "removed $STAND_IMAGE and its caches" >&2
+  docker image prune -f --filter "label=$STAND_LABEL" >/dev/null 2>&1 || true
+  rm -rf "$CACHE/cargo-$TAG" "$ROOT/target/$TAG"
+  # `$CACHE/rustup` is deliberately *not* removed: `scripts/cargo.sh` mounts the same directory for
+  # the gate image, and the stand's base is that image, so it is shared state rather than this
+  # script's. An earlier version removed "$CACHE/rustup-$TAG", a path nothing ever creates.
+  echo "removed $STAND_IMAGE, its predecessors and its caches" >&2
+  echo "the build cache (docker builder) and \$CACHE/rustup are shared; 'docker builder prune' reclaims the first" >&2
   exit 0
 fi
 

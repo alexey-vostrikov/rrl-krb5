@@ -13,6 +13,12 @@
 ARG BASE=rust:1.99.1-bullseye
 FROM ${BASE}
 
+# So that `scripts/live.sh clean` can find this image even when a rebuild has left it untagged:
+# `docker image rm` on the tag only reclaims the newest build, and every earlier one stays on disk
+# as a dangling 2.6 GB layer. The label is part of the image definition rather than a `--label` on
+# the command line, so a copy built by hand carries it too.
+LABEL rrl-krb5.stand=kdc
+
 ENV DEBIAN_FRONTEND=noninteractive
 # No `krb5-pkinit` on purpose. `scripts/test-kdc.sh` turns PKINIT on when openssl and MIT's pkinit
 # plugin are both present, and bullseye's openssl is 1.1.1, which has no `ca -gencrl
