@@ -65,7 +65,14 @@ tickets without shelling out to `kinit`.
   FAST armor from an anonymous TGT (`auto_fast_armor`). Key exchange by
   Diffie-Hellman over MODP groups 14 and 16, or by ECDH on P-256, P-384
   and P-521 against MIT 1.22 and later (RFC 5349), with the RFC 8636 KDFs
-  and MIT's group negotiation; the KDC's signature (RSA or ECDSA),
+  and MIT's group negotiation; or **RSA key transport** (RFC 4556 §3.2.3.2),
+  where the KDC makes the reply key and hands it over in a CMS EnvelopedData
+  bound to the request by a checksum over the AS-REQ. MIT implements key
+  transport on neither side; Heimdal's KDC does from 7.8, behind
+  `[kdc] pkinit_allow_rsa_key_transport`, and only for a request that
+  carries no `clientPublicValue` — which is what
+  `pkinit_rsa_key_transport = true` asks for here (an option neither
+  reference client has). The KDC's signature (RSA or ECDSA),
   certificate chain (`pkinit_anchors`), its revocation (CRLs:
   `pkinit_revoke`, `pkinit_require_crl_checking`) and name are checked as
   MIT checks them. Pure Rust, no OpenSSL: crypto-bigint's constant-time arithmetic

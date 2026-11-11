@@ -64,6 +64,10 @@ pub(crate) const PA_PKINIT_KX: i32 = 147;
 pub(crate) const PA_AS_FRESHNESS: i32 = 150;
 /// RFC 6112 §5.4.1 key usage for PA-PKINIT-KX.
 const KU_PA_PKINIT_KX: u32 = 44;
+/// RFC 4556 §3.2.3.2: the checksum in a transported `ReplyKeyPack` is keyed with usage 6 over the
+/// whole AS-REQ — the same number as `KU_TGS_REQ_AUTH_CKSUM`, and Heimdal's `krb5_verify_checksum
+/// (context, crypto, 6, ...)` says so in as many words.
+const KU_PKINIT_REPLY_KEY: u32 = 6;
 /// KRB5_NT_WELLKNOWN, for `WELLKNOWN/ANONYMOUS`.
 pub(crate) const NT_WELLKNOWN: i32 = 11;
 /// KDCOptions request-anonymous (bit 16).
@@ -509,6 +513,11 @@ pub(crate) struct Settings {
     /// `pkinit_require_crl_checking`.
     pub(crate) require_crl_checking: bool,
     pub(crate) kdc_hostnames: Vec<String>,
+    /// `pkinit_rsa_key_transport`: ask for RSA key transport by leaving the AuthPack's
+    /// `clientPublicValue` out. Neither MIT's nor Heimdal's client has such a switch — both always
+    /// send a DH value, and Heimdal's KDC takes the RSA branch only when the value is absent
+    /// (`[kdc] pkinit_allow_rsa_key_transport`). Off by default for the same reason.
+    pub(crate) rsa_key_transport: bool,
     pub(crate) dh_group: DhGroup,
     /// `[realms] REALM auto_fast_armor`.
     pub(crate) auto_fast_armor: bool,
@@ -548,6 +557,7 @@ impl Settings {
             crl_specs: Self::values(conf, realm, "pkinit_revoke"),
             require_crl_checking: truthy(one("pkinit_require_crl_checking").as_deref()),
             kdc_hostnames: Self::values(conf, realm, "pkinit_kdc_hostname"),
+            rsa_key_transport: truthy(one("pkinit_rsa_key_transport").as_deref()),
             dh_group: one("pkinit_dh_min_bits")
                 .and_then(|v| DhGroup::from_config(&v))
                 .unwrap_or_default(),
@@ -587,7 +597,12 @@ impl Settings {
 
 /// The state between a PA-PK-AS-REQ and its reply.
 pub(crate) struct Request {
-    keys: KeyExchange,
+    /// `None` when the request asked for RSA key transport: that AuthPack carries no
+    /// `clientPublicValue`, so there is no DH state to keep.
+    keys: Option<KeyExchange>,
+    /// The identity whose certificate the reply key may be encrypted to, kept for the RSA branch —
+    /// the KDC wraps the reply key in the certificate it verified, which is one of ours.
+    client: Option<(rsa::PrivateKey, x509::Cert)>,
     nonce: u32,
 }
 
@@ -606,6 +621,9 @@ pub(crate) struct RequestInput<'a> {
     pub(crate) usec: u32,
     pub(crate) freshness: Option<&'a [u8]>,
     pub(crate) group: DhGroup,
+    /// Ask for RSA key transport instead of DH: the AuthPack then carries no
+    /// `clientPublicValue` (RFC 4556 §3.2.3.1).
+    pub(crate) rsa_key_transport: bool,
 }
 
 /// The PA-PK-AS-REQ value for `input`, and the state to read the reply.
@@ -622,7 +640,25 @@ pub(crate) struct RequestInput<'a> {
 ///     paChecksum2 [5] SEQUENCE { checksum [0], algorithmIdentifier [1] } }  -- SHA-256
 /// ```
 pub(crate) fn request(input: &RequestInput<'_>) -> Result<(Vec<u8>, Request)> {
-    let keys = KeyExchange::generate(input.group);
+    // Asking for key transport when nothing can receive it is a configuration error, and it is
+    // answered here rather than by a KDC with a code that reads like a protocol fault.
+    if input.rsa_key_transport {
+        match input.identity {
+            None => {
+                return pk_err(
+                    "pkinit_rsa_key_transport needs a certificate; an anonymous request has none",
+                );
+            }
+            Some(id) if id.key.rsa().is_none() => {
+                return pk_err(
+                    "pkinit_rsa_key_transport needs an RSA key: the KDC encrypts to a modulus, \
+                     and an elliptic-curve key has none",
+                );
+            }
+            Some(_) => {}
+        }
+    }
+    let keys = (!input.rsa_key_transport).then(|| KeyExchange::generate(input.group));
     let mut authenticator = vec![
         der::field(0, der::int(i64::from(input.usec))),
         der::field(1, der::time(input.now)),
@@ -639,18 +675,23 @@ pub(crate) fn request(input: &RequestInput<'_>) -> Result<(Vec<u8>, Request)> {
             der::field(1, asn1::alg_id(keys::Hash::Sha256.oid(), None)),
         ]),
     ));
-    let auth_pack = der::seq(&[
+    let mut fields = vec![
         der::field(0, der::seq(&authenticator)),
-        der::field(1, keys.spki()),
         der::field(
             2,
             der::seq(&keys::SigAlg::ALL.map(|a| asn1::alg_id(a.oid(), None))),
         ),
-        der::field(
+    ];
+    // RSA key transport is asked for by saying nothing: no `clientPublicValue`, and no KDFs
+    // either, since the KDF is the DH agreement's and there is no agreement.
+    if let Some(k) = &keys {
+        fields.insert(1, der::field(1, k.spki()));
+        fields.push(der::field(
             4,
             der::seq(&kdf::OFFERED.map(|k| der::seq(&[der::field(0, asn1::oid_tlv(k))]))),
-        ),
-    ]);
+        ));
+    }
+    let auth_pack = der::seq(&fields);
     let signed = match input.identity {
         Some(id) => cms::signed_data(
             cms::ID_PKINIT_AUTH_DATA,
@@ -669,6 +710,9 @@ pub(crate) fn request(input: &RequestInput<'_>) -> Result<(Vec<u8>, Request)> {
         der::seq(&[der::tlv(asn1::implicit(0), &signed)]),
         Request {
             keys,
+            client: input
+                .identity
+                .and_then(|id| Some((id.key.rsa()?, id.certs.first()?.clone()))),
             nonce: input.nonce,
         },
     ))
@@ -691,8 +735,9 @@ pub(crate) struct ReplyInput<'a> {
 }
 
 impl Request {
-    pub(crate) fn group(&self) -> DhGroup {
-        self.keys.group()
+    /// The DH group this request offered, if it offered one.
+    pub(crate) fn group(&self) -> Option<DhGroup> {
+        self.keys.as_ref().map(KeyExchange::group)
     }
 
     /// The reply key from a PA-PK-AS-REP, after checking the KDC.
@@ -707,14 +752,25 @@ impl Request {
     /// ```
     pub(crate) fn reply_key(&self, r: &ReplyInput<'_>) -> Result<Key> {
         let mut top = Reader::new(r.pa_value);
-        let (tag, dh_info) = top.next()?;
+        let (tag, body) = top.next()?;
         top.done("PA-PK-AS-REP")?;
-        if tag != der::ctx(0) {
-            return pk_err(
-                "the KDC answered with RSA key transport, which is not supported (nor accepted by MIT)",
-            );
+        let anchors = r.settings.anchors()?;
+        let crls = r.settings.crls()?;
+        let revocation = crl::Policy {
+            local: &crls.crls,
+            require: r.settings.require_crl_checking,
+        };
+        // `encKeyPack [1] IMPLICIT OCTET STRING` is primitive; `dhInfo [0] DHRepInfo` is not.
+        if tag == asn1::implicit(1) {
+            return self.transported_key(body, r, &anchors, revocation);
         }
-        let mut info = Reader::new(dh_info).seq()?;
+        if tag != der::ctx(0) {
+            return pk_err("the KDC's reply is neither a DH value nor a transported key");
+        }
+        let Some(keys) = &self.keys else {
+            return pk_err("the KDC answered with a DH value although the request offered none");
+        };
+        let mut info = Reader::new(body).seq()?;
         let signed = info.expect(asn1::implicit(0))?;
         info.optional(der::ctx(1))?; // serverDHNonce: unused, we sent no clientDHNonce
         let kdf_oid = match info.optional(der::ctx(2))? {
@@ -727,12 +783,6 @@ impl Request {
         };
         info.done("DHRepInfo")?;
 
-        let anchors = r.settings.anchors()?;
-        let crls = r.settings.crls()?;
-        let revocation = crl::Policy {
-            local: &crls.crls,
-            require: r.settings.require_crl_checking,
-        };
         let verified = cms::verify(
             signed,
             cms::ID_PKINIT_DHKEY_DATA,
@@ -748,8 +798,7 @@ impl Request {
         if f.get(1)?.u32()? != self.nonce {
             return pk_err("the KDC's DH key answers a different request (nonce)");
         }
-        let z = self
-            .keys
+        let z = keys
             .agree(kdc_public)
             .ok_or_else(|| ClientError::Pkinit("the KDC's DH public value is invalid".into()))?;
 
@@ -776,6 +825,67 @@ impl Request {
             }
         };
         Ok(Key::new(r.enctype, bytes)?)
+    }
+
+    /// RFC 4556 §3.2.3.2, the other branch: the KDC made the reply key itself and handed it over
+    /// encrypted in the client's certificate, checked by a checksum over the very request.
+    ///
+    /// ```text
+    /// encKeyPack [1] IMPLICIT OCTET STRING   -- ContentInfo of EnvelopedData
+    ///   └─ content: ContentInfo of SignedData, eContentType id-pkinit-rkeyData
+    ///        └─ ReplyKeyPack ::= SEQUENCE { replyKey [0] EncryptionKey, asChecksum [1] Checksum }
+    /// ```
+    ///
+    /// Heimdal's order is the one that matters: decrypt, *then* verify the signature inside, so an
+    /// unsigned or wrongly-signed key pack never becomes a key. The checksum is over the whole
+    /// AS-REQ with key usage 6, which is what binds this reply to this request.
+    fn transported_key(
+        &self,
+        enc_key_pack: &[u8],
+        r: &ReplyInput<'_>,
+        anchors: &TrustAnchors,
+        revocation: crl::Policy<'_>,
+    ) -> Result<Key> {
+        let Some((key, cert)) = &self.client else {
+            return pk_err(
+                "the KDC answered with RSA key transport, which needs an RSA client certificate",
+            );
+        };
+        let (content_type, signed) = cms::decrypt_enveloped(enc_key_pack, key, cert)
+            .map_err(|e| ClientError::Pkinit(format!("the KDC's transported key: {}", e.0)))?;
+        if content_type != asn1::oid(cms::ID_SIGNED_DATA) {
+            return pk_err("the KDC's transported key is not signed");
+        }
+        let verified = cms::verify(
+            &signed,
+            cms::ID_PKINIT_RKEY_DATA,
+            &anchors.certs,
+            revocation,
+            r.now,
+        )
+        .map_err(|e| ClientError::Pkinit(format!("KDC's reply: {}", e.0)))?;
+        check_kdc_certificate(&verified.signer, r.realm, &r.settings.kdc_hostnames)?;
+
+        let f = der::Fields::parse_tagged("ReplyKeyPack", der::SEQUENCE, &verified.content)?;
+        let reply_key = decode_key(f.get(0)?)?;
+        let c = der::Fields::parse_tagged("Checksum", der::SEQUENCE, f.raw(1)?)?;
+        let (cksum_type, checksum) = (c.int(0, "Checksum")? as i32, c.octets(1, "Checksum")?);
+        if reply_key.enctype() != r.enctype {
+            return pk_err("the KDC's transported key is of another enctype than the reply");
+        }
+        if cksum_type != reply_key.checksum_type() {
+            return pk_err(format!(
+                "the KDC's transported key carries checksum type {cksum_type}, not {}",
+                reply_key.checksum_type()
+            ));
+        }
+        if !reply_key
+            .verify_checksum(KU_PKINIT_REPLY_KEY, r.as_req, checksum)
+            .unwrap_or(false)
+        {
+            return pk_err("the KDC's transported key answers a different request (checksum)");
+        }
+        Ok(reply_key)
     }
 }
 
@@ -864,13 +974,14 @@ mod tests {
             usec: 7,
             freshness: Some(b"fresh"),
             group: DhGroup::Modp2048,
+            rsa_key_transport: false,
         }
     }
 
     /// The KDC's half of the exchange `req` opened: its public value (the
     /// BIT STRING's content) and the shared secret.
     fn kdc_side(req: &Request) -> (Vec<u8>, Vec<u8>) {
-        match &req.keys {
+        match req.keys.as_ref().expect("a DH request") {
             KeyExchange::Modp(k) => {
                 let kdc = dh::KeyPair::generate(k.group().clone());
                 let z = kdc.agree(&k.public_value()).unwrap();
@@ -1034,7 +1145,202 @@ mod tests {
             pa_value: der::tlv(asn1::implicit(1), b"enc key pack"),
             key: Key::random(18).unwrap(),
         };
-        assert!(fails(&kt, &settings()).contains("key transport"));
+        // RSA key transport, for a client with no certificate to receive it: refused by name.
+        assert!(fails(&kt, &settings()).contains("needs an RSA client certificate"));
+    }
+
+    /// An identity whose key is RSA: key transport encrypts to a modulus, and an EC key has none.
+    fn rsa_identity() -> Identity {
+        let chain = [
+            &include_bytes!("pkinit/testdata/kdc.pem")[..],
+            include_bytes!("pkinit/testdata/inter.pem"),
+        ]
+        .concat();
+        Identity::from_pem(&chain, include_bytes!("pkinit/testdata/kdc-key.pem")).unwrap()
+    }
+
+    /// The KDC's half of the other branch: a reply key of its own choosing, a ReplyKeyPack binding
+    /// it to `as_req`, signed by the KDC, and the whole thing encrypted to `to`.
+    fn transported(to: &x509::Cert, reply_key: &Key, as_req: &[u8], content_type: &str) -> Vec<u8> {
+        let checksum = reply_key.checksum(KU_PKINIT_REPLY_KEY, as_req).unwrap();
+        let pack = der::seq(&[
+            der::field(0, encode_key(reply_key)),
+            der::field(
+                1,
+                der::seq(&[
+                    der::field(0, der::int(i64::from(reply_key.checksum_type()))),
+                    der::field(1, der::octets(&checksum)),
+                ]),
+            ),
+        ]);
+        let signed = cms::signed_data(
+            content_type,
+            &pack,
+            Some(cms::Signer {
+                key: &cms::tests::kdc_key(),
+                certs: &[fixture("kdc"), fixture("inter")],
+            }),
+        )
+        .unwrap();
+        der::tlv(
+            asn1::implicit(1),
+            &cms::enveloped_data(cms::ID_SIGNED_DATA, &signed, to).unwrap(),
+        )
+    }
+
+    #[test]
+    fn a_request_for_key_transport_refuses_a_key_nothing_can_be_encrypted_to() {
+        let mut inp = input(b"body", None);
+        inp.rsa_key_transport = true;
+        let e = request(&inp).err().expect("a refusal").to_string();
+        assert!(e.contains("anonymous request has none"), "{e}");
+
+        let ec = Identity::from_pem(
+            include_bytes!("pkinit/testdata/ec-kdc.pem"),
+            include_bytes!("pkinit/testdata/ec-kdc-key.pem"),
+        )
+        .unwrap();
+        let mut inp = input(b"body", Some(&ec));
+        inp.rsa_key_transport = true;
+        let e = request(&inp).err().expect("a refusal").to_string();
+        assert!(e.contains("elliptic-curve key has none"), "{e}");
+    }
+
+    #[test]
+    fn a_request_for_key_transport_offers_no_public_value() {
+        let id = rsa_identity();
+        let mut inp = input(b"body", Some(&id));
+        inp.rsa_key_transport = true;
+        let (pa, req) = request(&inp).unwrap();
+        assert!(req.keys.is_none() && req.group().is_none());
+        let mut r = Reader::new(&pa).seq().unwrap();
+        let signed = r.expect(asn1::implicit(0)).unwrap();
+        let auth_pack = cms::verify(
+            signed,
+            cms::ID_PKINIT_AUTH_DATA,
+            &[fixture("ca")],
+            crl::Policy::default(),
+            NOW,
+        )
+        .unwrap()
+        .content;
+        let f =
+            der::Fields::parse("AuthPack", Reader::new(&auth_pack).seq().unwrap().rest()).unwrap();
+        assert!(f.opt(0).is_some(), "the authenticator is always there");
+        assert!(
+            f.opt(1).is_none(),
+            "no clientPublicValue asks for key transport"
+        );
+        assert!(f.opt(2).is_some(), "the CMS types are still offered");
+        assert!(f.opt(4).is_none(), "there is no DH agreement to key a KDF");
+    }
+
+    #[test]
+    fn a_transported_key_is_opened_and_bound_to_the_request() {
+        let client = Principal::new(1, ["alice"], REALM);
+        let id = rsa_identity();
+        let mut inp = input(b"body", Some(&id));
+        inp.rsa_key_transport = true;
+        let (_, req) = request(&inp).unwrap();
+        let key = Key::random(18).unwrap();
+        let to = fixture("kdc");
+        let pa_value = transported(&to, &key, b"the AS-REQ", cms::ID_PKINIT_RKEY_DATA);
+        let got = req
+            .reply_key(&ReplyInput {
+                settings: &settings(),
+                pa_value: &pa_value,
+                realm: REALM,
+                client: &client,
+                server: &Principal::krbtgt(REALM),
+                as_req: b"the AS-REQ",
+                enctype: 18,
+                now: NOW,
+            })
+            .unwrap();
+        assert_eq!(got, key);
+    }
+
+    #[test]
+    fn a_transported_key_that_does_not_answer_this_request_is_refused() {
+        let client = Principal::new(1, ["alice"], REALM);
+        let id = rsa_identity();
+        let mut inp = input(b"body", Some(&id));
+        inp.rsa_key_transport = true;
+        let (_, req) = request(&inp).unwrap();
+        let key = Key::random(18).unwrap();
+        let read = |pa_value: &[u8]| {
+            req.reply_key(&ReplyInput {
+                settings: &settings(),
+                pa_value,
+                realm: REALM,
+                client: &client,
+                server: &Principal::krbtgt(REALM),
+                as_req: b"the AS-REQ",
+                enctype: 18,
+                now: NOW,
+            })
+            .map_err(|e| e.to_string())
+        };
+        // The checksum is over another request.
+        let elsewhere = transported(
+            &fixture("kdc"),
+            &key,
+            b"ANOTHER AS-REQ",
+            cms::ID_PKINIT_RKEY_DATA,
+        );
+        let e = read(&elsewhere).unwrap_err();
+        assert!(e.contains("checksum"), "{e}");
+        // Encrypted to another certificate than ours.
+        let other = transported(
+            &fixture("host"),
+            &key,
+            b"the AS-REQ",
+            cms::ID_PKINIT_RKEY_DATA,
+        );
+        assert!(read(&other).unwrap_err().contains("another certificate"));
+        // Signed as a DH key info: the content type says what the content is.
+        let wrong_type = transported(
+            &fixture("kdc"),
+            &key,
+            b"the AS-REQ",
+            cms::ID_PKINIT_DHKEY_DATA,
+        );
+        assert!(read(&wrong_type).unwrap_err().contains("KDC's reply"));
+        // A DH value for a request that offered no public value.
+        let dh = Kdc {
+            pa_value: der::field(0, der::seq(&[der::tlv(asn1::implicit(0), b"nothing")])),
+            key: Key::random(18).unwrap(),
+        };
+        let s = settings();
+        assert!(
+            reply_key(&req, &s, &dh, &client)
+                .unwrap_err()
+                .to_string()
+                .contains("offered none")
+        );
+        // No RSA identity at all: nothing to decrypt the envelope with.
+        let (_, plain) = request(&input(b"body", None)).unwrap();
+        assert!(
+            plain
+                .reply_key(&ReplyInput {
+                    settings: &s,
+                    pa_value: &transported(
+                        &fixture("kdc"),
+                        &key,
+                        b"the AS-REQ",
+                        cms::ID_PKINIT_RKEY_DATA
+                    ),
+                    realm: REALM,
+                    client: &client,
+                    server: &Principal::krbtgt(REALM),
+                    as_req: b"the AS-REQ",
+                    enctype: 18,
+                    now: NOW,
+                })
+                .unwrap_err()
+                .to_string()
+                .contains("needs an RSA client certificate")
+        );
     }
 
     #[test]
@@ -1301,7 +1607,7 @@ mod tests {
             let mut inp = input(b"body", None);
             inp.group = group;
             let (pa, req) = request(&inp).unwrap();
-            assert_eq!(req.group(), group);
+            assert_eq!(req.group(), Some(group));
             // The AuthPack's clientPublicValue names the group.
             let mut r = Reader::new(&pa).seq().unwrap();
             let mut ci = Reader::new(r.expect(asn1::implicit(0)).unwrap())

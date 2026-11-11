@@ -19,6 +19,7 @@ fn request() -> &'static (Request, Vec<u8>) {
             usec: 0,
             freshness: None,
             group: DhGroup::P256,
+            rsa_key_transport: false,
         })
         .expect("an anonymous request");
         (req, body)

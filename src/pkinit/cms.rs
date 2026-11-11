@@ -29,13 +29,231 @@ fn err<T>(msg: impl Into<String>) -> Result<T> {
     Err(DerError(msg.into()))
 }
 
-const ID_SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
+pub(crate) const ID_SIGNED_DATA: &str = "1.2.840.113549.1.7.2";
 /// `id-pkinit-authData`: the AuthPack's content type.
 pub(crate) const ID_PKINIT_AUTH_DATA: &str = "1.3.6.1.5.2.3.1";
 /// `id-pkinit-DHKeyData`: the KDCDHKeyInfo's content type.
 pub(crate) const ID_PKINIT_DHKEY_DATA: &str = "1.3.6.1.5.2.3.2";
+/// `id-pkinit-rkeyData`: the ReplyKeyPack's content type, inside a transported key's SignedData.
+pub(crate) const ID_PKINIT_RKEY_DATA: &str = "1.3.6.1.5.2.3.4";
 const ATTR_CONTENT_TYPE: &str = "1.2.840.113549.1.9.3";
 const ATTR_MESSAGE_DIGEST: &str = "1.2.840.113549.1.9.4";
+
+/// `id-envelopedData`: what a KDC wraps the reply key in for RSA key transport.
+pub(crate) const ID_ENVELOPED_DATA: &str = "1.2.840.113549.1.7.3";
+/// `aes256-CBC` and `aes128-CBC` (RFC 3565): the content encryptions this crate opens.
+const ID_AES256_CBC: &str = "2.16.840.1.101.3.4.1.42";
+const ID_AES128_CBC: &str = "2.16.840.1.101.3.4.1.2";
+/// `rsaEncryption`, the only key transport CMS here opens.
+const RSA_ENCRYPTION: &str = "1.2.840.113549.1.1.1";
+
+/// An EnvelopedData ContentInfo holding `content`, its content-encryption key wrapped to
+/// `recipient` with RSA PKCS #1 v1.5 and AES-256-CBC under a fresh key and IV.
+///
+/// This is the shape a KDC's `encKeyPack` has (RFC 4556 §3.2.3.2: the KDC makes a reply key and
+/// "encrypts it in the client's public key"). The client only ever reads one — this builder exists
+/// for tests and for a KDC built on this crate.
+#[cfg(test)]
+pub(crate) fn enveloped_data(
+    content_type: &str,
+    content: &[u8],
+    recipient: &Cert,
+) -> Result<Vec<u8>> {
+    use rand::RngCore;
+    let mut cek = [0u8; 32];
+    let mut iv = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut cek);
+    rand::thread_rng().fill_bytes(&mut iv);
+    let encrypted = aes_cbc(true, &cek, &iv, content)?;
+    let wrapped = match recipient.public_key()? {
+        PublicKey::Rsa(k) => k.encrypt_pkcs1_v15(&cek)?,
+        PublicKey::Ec(_) => return err("RSA key transport needs an RSA client key"),
+    };
+
+    let ktri = der::seq(&[
+        der::int(0),
+        der::seq(&[
+            recipient.issuer.clone(),
+            der::tlv(der::INTEGER, &recipient.serial),
+        ]),
+        asn1::alg_id(RSA_ENCRYPTION, Some(asn1::null())),
+        der::octets(&wrapped),
+    ]);
+    let enveloped = der::seq(&[
+        der::int(0),
+        // `RecipientInfo ::= CHOICE { ktri KeyTransRecipientInfo, kari [1] ... }`: the key
+        // transport alternative is the untagged SEQUENCE, and [1] is key agreement, not this.
+        asn1::set_of(vec![ktri]),
+        der::seq(&[
+            asn1::oid_tlv(content_type),
+            asn1::alg_id(ID_AES256_CBC, Some(der::octets(&iv))),
+            // `encryptedContent [0] IMPLICIT OCTET STRING`, primitive: an explicit length makes
+            // the constructed form unnecessary, and DER has no unnecessary forms.
+            der::tlv(asn1::implicit(0), &encrypted),
+        ]),
+    ]);
+    Ok(der::seq(&[
+        asn1::oid_tlv(ID_ENVELOPED_DATA),
+        der::field(0, enveloped),
+    ]))
+}
+
+/// The content of an EnvelopedData encrypted to `cert`, opened with `key`: its content type, and
+/// the plaintext.
+///
+/// An envelope addressed to another certificate is refused by name rather than attempted: a KDC
+/// that answered with somebody else's envelope answered the wrong request, and a caller told
+/// otherwise would hold a key it cannot use.
+pub(crate) fn decrypt_enveloped(
+    content_info: &[u8],
+    key: &rsa::PrivateKey,
+    cert: &Cert,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut ci = Reader::new(content_info).seq()?;
+    if ci.oid()? != asn1::oid(ID_ENVELOPED_DATA).as_slice() {
+        return err("the KDC's reply key is not an EnvelopedData");
+    }
+    let enveloped = ci.expect(der::ctx(0))?;
+    ci.done("ContentInfo")?;
+
+    let mut ed = Reader::new(enveloped).seq()?;
+    ed.uint()?;
+    if ed.optional(der::ctx(0))?.is_some() {
+        return err("the reply key's EnvelopedData carries an originatorInfo");
+    }
+    // `recipientInfos SET OF RecipientInfo`: the same encoding as a SEQUENCE, a different tag.
+    let mut recipients = Reader::new(ed.expect(0x31)?);
+    let mut found = None;
+    while !recipients.is_empty() {
+        let (tag, content) = recipients.next()?;
+        if tag == der::SEQUENCE && found.is_none() {
+            found = Some(content);
+        } else if tag == der::ctx(1) {
+            return err(
+                "the reply key uses CMS key agreement, not key transport (nothing agreed a KEK)",
+            );
+        }
+    }
+    let ktri = found.ok_or_else(|| {
+        DerError("the reply key uses a recipient type this client does not implement".into())
+    })?;
+
+    let mut ktri = Reader::new(ktri);
+    ktri.uint()?;
+    let (issuer, serial) = {
+        let mut rid = ktri.seq()?;
+        // The issuer is compared as the whole `Name` TLV, the serial as the INTEGER's content.
+        let issuer = rid.next_raw()?.2.to_vec();
+        let serial = asn1::uint_content(rid.next_raw()?.1)?.to_vec();
+        (issuer, serial)
+    };
+    if issuer != cert.issuer || serial != cert.serial {
+        return err("the reply key is encrypted to another certificate");
+    }
+    let (alg, _) = ktri.alg_id()?;
+    if alg != asn1::oid(RSA_ENCRYPTION).as_slice() {
+        return err("the reply key is not encrypted with RSA PKCS #1 v1.5");
+    }
+    let wrapped = ktri.octets()?.to_vec();
+    ktri.done("KeyTransRecipientInfo")?;
+    let cek = key.decrypt_pkcs1_v15(&wrapped)?;
+
+    let mut eci = ed.seq()?;
+    let content_type = eci.oid()?.to_vec();
+    let (alg, params) = eci.alg_id()?;
+    let params =
+        params.ok_or_else(|| DerError("the reply key's content encryption has no IV".into()))?;
+    let iv = Reader::new(params).octets()?.to_vec();
+    // Primitive as DER writes it; BER may construct it, and a KDC in the wild has been seen to.
+    let (tag, ciphertext) = eci.next()?;
+    if tag != asn1::implicit(0) && tag != der::ctx(0) {
+        return err("the reply key's content encryption carries no ciphertext");
+    }
+    let plaintext = if alg == asn1::oid(ID_AES256_CBC).as_slice() {
+        aes_cbc(false, &cek, &iv, ciphertext)?
+    } else if alg == asn1::oid(ID_AES128_CBC).as_slice() {
+        aes_cbc(
+            false,
+            cek.get(..16)
+                .ok_or_else(|| DerError("a short key".into()))?,
+            &iv,
+            ciphertext,
+        )?
+    } else {
+        return err("the reply key's content encryption is not AES-CBC");
+    };
+    Ok((content_type, plaintext))
+}
+
+/// One AES block, in place: the primitive CBC is built from.
+type BlockFn = Box<dyn Fn(&mut [u8; 16])>;
+
+/// AES-CBC with PKCS #7 padding, in one direction. Kerberos has CTS of its own; CMS does not, and
+/// this crate asks AES for nothing more than single blocks here.
+fn aes_cbc(encrypt: bool, key: &[u8], iv: &[u8], input: &[u8]) -> Result<Vec<u8>> {
+    use aes::cipher::{BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
+    if iv.len() != 16 {
+        return err("the IV is not 16 octets");
+    }
+    let mut prev: [u8; 16] = iv.try_into().unwrap();
+    let block: BlockFn = match (key.len(), encrypt) {
+        (32, true) => {
+            let c =
+                aes::Aes256::new_from_slice(key).map_err(|_| DerError("a bad AES key".into()))?;
+            Box::new(move |b: &mut [u8; 16]| c.encrypt_block(b.into()))
+        }
+        (32, false) => {
+            let c =
+                aes::Aes256::new_from_slice(key).map_err(|_| DerError("a bad AES key".into()))?;
+            Box::new(move |b: &mut [u8; 16]| c.decrypt_block(b.into()))
+        }
+        (16, true) => {
+            let c =
+                aes::Aes128::new_from_slice(key).map_err(|_| DerError("a bad AES key".into()))?;
+            Box::new(move |b: &mut [u8; 16]| c.encrypt_block(b.into()))
+        }
+        (16, false) => {
+            let c =
+                aes::Aes128::new_from_slice(key).map_err(|_| DerError("a bad AES key".into()))?;
+            Box::new(move |b: &mut [u8; 16]| c.decrypt_block(b.into()))
+        }
+        _ => return err("the AES key is neither 16 nor 32 octets"),
+    };
+
+    let mut data = input.to_vec();
+    if encrypt {
+        let pad = 16 - data.len() % 16;
+        data.extend(std::iter::repeat_n(pad as u8, pad));
+    } else if data.is_empty() || data.len() % 16 != 0 {
+        return err("the ciphertext is not whole blocks");
+    }
+    let mut out = Vec::with_capacity(data.len());
+    for chunk in data.chunks(16) {
+        let mut b: [u8; 16] = chunk.try_into().unwrap();
+        if encrypt {
+            for (x, p) in b.iter_mut().zip(prev.iter()) {
+                *x ^= *p;
+            }
+            block(&mut b);
+            prev = b;
+        } else {
+            block(&mut b);
+            for (x, p) in b.iter_mut().zip(prev.iter()) {
+                *x ^= *p;
+            }
+            prev = chunk.try_into().unwrap();
+        }
+        out.extend_from_slice(&b);
+    }
+    if !encrypt {
+        let pad = *out.last().unwrap() as usize;
+        if pad == 0 || pad > 16 || out[out.len() - pad..].iter().any(|&b| b as usize != pad) {
+            return err("the padding is not PKCS #7");
+        }
+        out.truncate(out.len() - pad);
+    }
+    Ok(out)
+}
 
 /// `[0] EXPLICIT OCTET STRING` holding `content`.
 fn econtent(content_type: &str, content: &[u8]) -> Vec<u8> {
@@ -323,6 +541,58 @@ pub(crate) mod tests {
             e.0.contains("depth 0") && e.0.contains("pkinit_require_crl_checking"),
             "{e}"
         );
+    }
+
+    /// An EnvelopedData made by OpenSSL, not by this crate:
+    ///
+    /// ```text
+    /// printf 'the transport reply key' > content.bin
+    /// openssl cms -encrypt -aes256 -binary -in content.bin -outform DER \
+    ///     -out openssl-enveloped.der src/pkinit/testdata/kdc.pem
+    /// ```
+    ///
+    /// A CMS envelope is only useful if it opens the ones other implementations write, and this is
+    /// the one fixture in the tree that pins that: the recipient is `IssuerAndSerialNumber` of
+    /// kdc.pem, the content encryption is aes-256-cbc with the IV in the parameters, and the padding
+    /// is PKCS #7.
+    #[test]
+    fn an_envelope_from_openssl_opens() {
+        let cert = fixture("kdc");
+        let key = kdc_key().rsa().expect("an RSA test key");
+        let (content_type, content) = decrypt_enveloped(
+            include_bytes!("testdata/openssl-enveloped.der"),
+            &key,
+            &cert,
+        )
+        .unwrap();
+        assert_eq!(content_type, asn1::oid("1.2.840.113549.1.7.1"));
+        assert_eq!(content, b"the transport reply key");
+        // And the same envelope for another certificate is refused rather than attempted.
+        let e = decrypt_enveloped(
+            include_bytes!("testdata/openssl-enveloped.der"),
+            &key,
+            &fixture("host"),
+        )
+        .unwrap_err();
+        assert!(e.0.contains("another certificate"), "{e}");
+    }
+
+    /// What this crate writes is what OpenSSL reads: the reverse of the test above, as a
+    /// round trip through the same fixed key.
+    #[test]
+    fn an_envelope_this_crate_writes_opens_with_our_own_decoder() {
+        let cert = fixture("kdc");
+        let key = kdc_key().rsa().expect("an RSA test key");
+        let content = b"a reply key pack, signed and then enveloped";
+        let env = enveloped_data(ID_PKINIT_RKEY_DATA, content, &cert).unwrap();
+        let (content_type, got) = decrypt_enveloped(&env, &key, &cert).unwrap();
+        assert_eq!(content_type, asn1::oid(ID_PKINIT_RKEY_DATA));
+        assert_eq!(got, content);
+        // A message tampered with in the ciphertext fails the padding check, not the RSA one.
+        let mut bad = env.clone();
+        let n = bad.len();
+        bad[n - 20] ^= 0xff;
+        assert!(decrypt_enveloped(&bad, &key, &cert).is_err());
     }
 
     /// A SignedData as the test KDC would sign it, with its chain.

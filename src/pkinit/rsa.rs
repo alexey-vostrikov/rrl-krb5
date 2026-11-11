@@ -79,6 +79,37 @@ impl PublicKey {
             .into_iter()
             .any(|null| emsa(hash, digest, k, null).as_deref() == Some(&em[..]))
     }
+
+    /// This modulus' length in octets: what an encrypted block must fill.
+    #[cfg(test)]
+    pub(crate) fn modulus_len(&self) -> usize {
+        self.n.len()
+    }
+
+    /// PKCS #1 v1.5 **encryption** (type 2) of `plaintext`: `00 02 PS 00 M`, with `PS` non-zero and
+    /// at least eight octets long. The mirror of [`PrivateKey::decrypt_pkcs1_v15`].
+    #[cfg(test)]
+    pub(crate) fn encrypt_pkcs1_v15(&self, plaintext: &[u8]) -> Result<Vec<u8>, DerError> {
+        use rand::RngCore;
+        let k = self.modulus_len();
+        if plaintext.len() + 11 > k {
+            return Err(DerError(
+                "the plaintext does not fit this RSA key with PKCS #1 v1.5 padding".into(),
+            ));
+        }
+        let mut em = vec![0x00, 0x02];
+        let mut ps = vec![0u8; k - plaintext.len() - 3];
+        while ps.contains(&0) {
+            rand::thread_rng().fill_bytes(&mut ps);
+        }
+        em.extend_from_slice(&ps);
+        em.push(0x00);
+        em.extend_from_slice(plaintext);
+        if !less(&em, &self.n) {
+            return Err(DerError("the padded block is not below the modulus".into()));
+        }
+        modpow(&em, &self.e, &self.n).ok_or_else(|| DerError("RSA encryption failed".into()))
+    }
 }
 
 /// An RSA private key.
@@ -145,6 +176,45 @@ impl PrivateKey {
             ));
         }
         Ok(sig)
+    }
+
+    /// The plaintext of a PKCS #1 v1.5 **encryption** block (type 2), which is what CMS
+    /// `KeyTransRecipientInfo` carries: `c = m^d mod n`, then `00 02 PS 00 M` with at least eight
+    /// non-zero padding octets.
+    ///
+    /// The padding check is deliberately one error: a decoder that says *which* byte of the padding
+    /// was wrong hands an attacker the oracle PKCS #1 v1.5 is famous for, and there is nothing an
+    /// operator could do with the distinction anyway. Type 1 (a signature block) is refused rather
+    /// than unwrapped — a signature fed in as an encrypted key must not produce a plaintext.
+    pub(crate) fn decrypt_pkcs1_v15(&self, ciphertext: &[u8]) -> Result<Vec<u8>, DerError> {
+        let k = self.public.n.len();
+        if ciphertext.len() > k || ciphertext.is_empty() {
+            return Err(DerError(
+                "the encrypted key is not the modulus' length".into(),
+            ));
+        }
+        let mut c = vec![0; k - ciphertext.len()];
+        c.extend_from_slice(ciphertext);
+        if !less(&c, &self.public.n) {
+            return Err(DerError(
+                "the encrypted key is not below the modulus".into(),
+            ));
+        }
+        let m = modpow(&c, &self.d, &self.public.n)
+            .ok_or_else(|| DerError("RSA decryption failed".into()))?;
+        // `modpow` may drop leading zero octets; the block is exactly k long.
+        let mut em = vec![0; k - m.len().min(k)];
+        em.extend_from_slice(&m[m.len().saturating_sub(k)..]);
+        let bad = || DerError("the encrypted key is not a PKCS #1 v1.5 block".into());
+        if em.len() != k || em[0] != 0x00 || em[1] != 0x02 {
+            return Err(bad());
+        }
+        let rest = &em[2..];
+        let sep = rest.iter().position(|&b| b == 0).ok_or_else(bad)?;
+        if sep < 8 {
+            return Err(bad());
+        }
+        Ok(rest[sep + 1..].to_vec())
     }
 }
 

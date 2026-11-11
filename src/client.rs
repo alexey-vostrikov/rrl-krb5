@@ -579,6 +579,9 @@ struct PkState {
     rfc6112_kdc: bool,
     #[cfg(feature = "pkinit")]
     group: pkinit::DhGroup,
+    /// `pkinit_rsa_key_transport`: ask for the reply key to be transported rather than agreed.
+    #[cfg(feature = "pkinit")]
+    rsa_key_transport: bool,
 }
 
 /// The times a KDC request asks for (KDC-REQ-BODY from, till, rtime).
@@ -1911,6 +1914,7 @@ impl KdcClient {
         #[cfg(feature = "pkinit")]
         {
             pk.group = self.pkinit.dh_group;
+            pk.rsa_key_transport = self.pkinit.rsa_key_transport;
         }
         let mut spake = spake::Spake::default();
         let mut spake_key: Option<Key> = None;
@@ -1958,6 +1962,7 @@ impl KdcClient {
                         usec,
                         freshness: pk.freshness.as_deref(),
                         group: pk.group,
+                        rsa_key_transport: pk.rsa_key_transport,
                     })?;
                     padata.insert(0, (pkinit::PA_PK_AS_REQ, value));
                     pk.request = Some(request);
@@ -2028,6 +2033,8 @@ impl KdcClient {
                         pk = PkState {
                             #[cfg(feature = "pkinit")]
                             group: pk.group,
+                            #[cfg(feature = "pkinit")]
+                            rsa_key_transport: pk.rsa_key_transport,
                             ..PkState::default()
                         };
                         continue;
@@ -2050,7 +2057,7 @@ impl KdcClient {
                         // MIT's tryagain: the KDC lists the groups it takes;
                         // ask again with the first stronger one we have.
                         if e.code == pkinit::KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED {
-                            let offered = pk.request.as_ref().map(|r| r.group());
+                            let offered = pk.request.as_ref().and_then(|r| r.group());
                             if let Some(g) = offered.and_then(|o| {
                                 pkinit::negotiate_group(e.e_data.as_deref().unwrap_or(&[]), o)
                             }) {

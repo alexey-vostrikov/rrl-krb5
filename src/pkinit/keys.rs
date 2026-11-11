@@ -139,6 +139,15 @@ pub(crate) enum PrivateKey {
 }
 
 impl PrivateKey {
+    /// The key as an RSA key, when it is one: RSA key transport needs a modulus to be encrypted
+    /// to, and an EC key cannot receive it.
+    pub(crate) fn rsa(&self) -> Option<rsa::PrivateKey> {
+        match self {
+            PrivateKey::Rsa(k) => Some(k.clone()),
+            PrivateKey::Ec(_) => None,
+        }
+    }
+
     /// The first private key among PEM blocks: PKCS #8 `PRIVATE KEY`
     /// (RSA or EC), `RSA PRIVATE KEY` (PKCS #1) or `EC PRIVATE KEY`
     /// (SEC1), unencrypted.
