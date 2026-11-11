@@ -103,9 +103,27 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
-      - run: |
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq krb5-kdc krb5-admin-server krb5-user krb5-pkinit krb5-otp python3-gssapi
+      - name: Install MIT's KDC and the Python bindings
+        # A retry, because the runner's resolver is not always there: this job failed twice on
+        # `Temporary failure resolving 'azure.archive.ubuntu.com'` — the mirror in the runner's own
+        # `/etc/apt/apt-mirrors.txt` — while `live-kdc-mit122`, which installs from the same
+        # mirrors, passed on the same commit. `Acquire::Retries` covers a connection that
+        # truncates; it does not cover a resolver that answers nothing, so the attempt is repeated
+        # and the failure is reported only when every attempt has failed.
+        run: |
+          set -eu
+          sudo -S -p '' apt-get update -qq
+          for attempt in 1 2 3; do
+            if sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+                 -o Acquire::Retries=3 --fix-missing \
+                 krb5-kdc krb5-admin-server krb5-user krb5-pkinit krb5-otp python3-gssapi; then
+              exit 0
+            fi
+            echo "apt-get install failed on attempt $attempt of 3; waiting" >&2
+            sleep $((attempt * 20))
+          done
+          echo "apt-get install failed three times; the runner could not reach its mirror" >&2
+          exit 1
       - run: scripts/test-kdc.sh "$RUNNER_TEMP/krb5test"
       - run: cat "$RUNNER_TEMP/krb5test/test.env" >> "$GITHUB_ENV"
       # PKINIT and OTP must be set up here, not skipped.
