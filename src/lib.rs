@@ -129,7 +129,8 @@ mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
 pub mod key;
 pub mod keytab; // FILE:, MEMORY: and ANY: keytab sources (Heimdal `krb5_kt_resolve`)
 pub mod kpasswd; // password changes over the kpasswd protocol (RFC 3244)
-pub mod kuserok; // may this principal log in as this local user (Heimdal `krb5_kuserok`)
+pub mod kuserok;
+pub mod kx509; // RFC 6717: a certificate for a ticket // may this principal log in as this local user (Heimdal `krb5_kuserok`)
 mod md5; // RFC 1321 and HMAC-MD5: channel bindings, PAC signatures, MS-SFU
 mod net; // the sockets, blocking or tokio's
 #[cfg(test)]

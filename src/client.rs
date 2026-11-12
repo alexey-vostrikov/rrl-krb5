@@ -134,6 +134,18 @@ pub enum ClientError {
     /// KDC will accept.
     #[error("no usable key: {0}")]
     NoKey(String),
+    /// The kx509 service answered with a non-zero `error-code` (RFC 6717 §4).
+    ///
+    /// Its numbering is its own: `1` and `4` are permanent client and server problems, and
+    /// `1000 + n` is an RFC 4120 error the KDC ran into. Reported apart from [`Self::Kdc`] because
+    /// `kdc_error_name` would name the wrong table for it.
+    #[error("kx509 error {code}{}", text.as_ref().map(|t| format!(": {t}")).unwrap_or_default())]
+    Kx509 {
+        /// The response's `error-code`.
+        code: i32,
+        /// Its `e-text`, if any.
+        text: Option<String>,
+    },
     /// The credential cache could not be read or written.
     #[error("credential cache: {0}")]
     Cache(#[from] CacheError),
