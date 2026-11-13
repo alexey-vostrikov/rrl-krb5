@@ -175,20 +175,12 @@ pub trait Mechanism: fmt::Debug + Send + Sync {
     fn oids(&self) -> &'static [&'static [u8]];
 
     /// `gss_init_sec_context`, first call: the context and the token to send.
-    fn initiator(
-        &self,
-        creds: &Credentials,
-        flags: u32,
-    ) -> Result<Established, GssError>;
+    fn initiator(&self, creds: &Credentials, flags: u32) -> Result<Established, GssError>;
 
     /// `gss_accept_sec_context`, first call: the context and the reply to send, if any.
     ///
     /// The token is the peer's, already framed — the layer dispatched on its OID to get here.
-    fn accept(
-        &self,
-        keytab: &Keytab,
-        token: &[u8],
-    ) -> Result<Established, GssError>;
+    fn accept(&self, keytab: &Keytab, token: &[u8]) -> Result<Established, GssError>;
 }
 
 /// One established-or-establishing security context.
@@ -411,11 +403,7 @@ impl Registry {
     /// The OID is read from the token rather than passed in, because that is what the token is for:
     /// an acceptor that had to be told which mechanism to expect could not serve two kinds of client
     /// on one port, which is exactly what HTTP `Negotiate` and SMB do.
-    pub fn acceptor(
-        &self,
-        keytab: &Keytab,
-        token: &[u8],
-    ) -> Result<Established, GssError> {
+    pub fn acceptor(&self, keytab: &Keytab, token: &[u8]) -> Result<Established, GssError> {
         let oid = token_mech(token)?;
         let mechanism = self.find(oid).ok_or_else(|| GssError::UnknownMechanism {
             oid: describe_oid(oid),
@@ -477,11 +465,7 @@ impl Mechanism for Krb5 {
         &[KRB5, MS_KRB5]
     }
 
-    fn initiator(
-        &self,
-        creds: &Credentials,
-        flags: u32,
-    ) -> Result<Established, GssError> {
+    fn initiator(&self, creds: &Credentials, flags: u32) -> Result<Established, GssError> {
         let (ctx, token) = InitiatorContext::new(creds, flags)?;
         Ok((
             Box::new(Initiating {
@@ -492,11 +476,7 @@ impl Mechanism for Krb5 {
         ))
     }
 
-    fn accept(
-        &self,
-        keytab: &Keytab,
-        token: &[u8],
-    ) -> Result<Established, GssError> {
+    fn accept(&self, keytab: &Keytab, token: &[u8]) -> Result<Established, GssError> {
         let (ctx, reply) = KerberosContext::accept_token(keytab, token)?;
         // Built before the context is moved into the adapter: the keys come from it.
         let per_message = build_per_message_accept(&ctx)?;
