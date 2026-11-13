@@ -2392,12 +2392,6 @@ impl KerberosContext {
         if used_initiator_subkey {
             info!("   Adopting the initiator's subkey as the per-message base key");
         }
-        // The AP-REP is sealed with this same base key (RFC 4121 §2). Taken here, before `base_key` is
-        // moved into the context below.
-        let ap_rep_key = SessionKey {
-            enctype: base_key_enctype,
-            key: base_key.clone(),
-        };
 
         let mut cb_match = false;
         let (mut gss_flags, delegated) = match &authenticator.cksum {
@@ -2462,15 +2456,9 @@ impl KerberosContext {
         // RFC 4120 §3.2.4: an AP-REP is the answer to MUTUAL-REQUIRED and
         // to nothing else. Sending one unasked breaks the initiator, which
         // is already established and rejects the extra token.
-        //
-        // RFC 4121 §2: the AP-REP is sealed with the **base key**, which is the initiator's subkey when
-        // it sent one. Sealing it with the ticket's session key instead is what a Windows client answers
-        // with `SEC_E_INVALID_TOKEN` (0x80090308) and an abandoned session: it has the subkey, tries to
-        // open the enc-part with it, and gets nonsense. Measured on the AD-join stand, where the client
-        // does send a subkey and LDAP - whose .NET client does not - accepted the same acceptor.
         let ap_rep = if mutual {
             Self::generate_ap_rep_with_crypto(
-                &ap_rep_key,
+                &session_key,
                 authenticator.ctime,
                 authenticator.cusec,
                 oid,
