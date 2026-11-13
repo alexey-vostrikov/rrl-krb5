@@ -1306,10 +1306,10 @@ fn mits_spnego_initiator_against_our_acceptor() {
         ) else {
             return;
         };
-        let mut acc = krb5::spnego::SpnegoAcceptor::new(&keytab);
+        let mut acc = krb5::spnego::SpnegoAcceptor::new();
         while let Some(token) = mit.token().unwrap() {
             assert!(!acc.is_established(), "MIT sent a token after we finished");
-            if let Some(reply) = acc.step(&token).unwrap() {
+            if let Some(reply) = acc.step(&keytab, &token).unwrap() {
                 mit.send(&reply);
             }
         }
@@ -1443,10 +1443,10 @@ fn our_acceptor_checks_mits_channel_bindings() {
             };
             let mut opts = krb5::acceptor::AcceptOptions::default();
             opts.channel_bindings = Some(ours.clone());
-            let mut acc = krb5::spnego::SpnegoAcceptor::with_options(&keytab, opts);
+            let mut acc = krb5::spnego::SpnegoAcceptor::with_options(opts);
             let token = mit.token().unwrap().unwrap();
             let label = format!("spnego {spnego}, MIT {extra:?}, CBT {cbt}");
-            match acc.step(&token) {
+            match acc.step(&keytab, &token) {
                 Ok(reply) => {
                     assert!(accepted, "{label}: we accepted");
                     let flags = acc.context().unwrap().gss_flags;

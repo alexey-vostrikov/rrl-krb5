@@ -53,6 +53,7 @@ use crate::acceptor::{KerberosContext, KerberosError, Keytab};
 use crate::client::{ClientError, Credentials};
 use crate::der;
 use crate::initiator::InitiatorContext;
+use crate::spnego::{SpnegoAcceptor, SpnegoInitiator};
 use crate::token::{ContextKey, PerMessageTokens, Verified};
 
 /// Everything the layer can refuse, from either side.
@@ -144,6 +145,14 @@ pub const KRB5: &[u8] = &[0x2A, 0x86, 0x48, 0x86, 0xF7, 0x12, 0x01, 0x02, 0x02];
 /// mechanism list, MIT accepts it as Kerberos 5, and this crate's acceptor already accepts both. A
 /// registry that treated it as separate would have two entries that build identical contexts.
 pub const MS_KRB5: &[u8] = &[0x2A, 0x86, 0x48, 0x82, 0xF7, 0x12, 0x01, 0x02, 0x02];
+
+/// `1.3.6.1.5.5.2`: SPNEGO (RFC 4178), as content octets.
+///
+/// A negotiation wrapper rather than an authentication mechanism: its tokens carry another
+/// mechanism's token inside. It is registered here because that is what a peer sends — HTTP
+/// `Negotiate` and SMB both open with it — and an acceptor that did not know the OID would refuse
+/// a client that only ever offered the wrapper.
+pub const SPNEGO: &[u8] = &[0x2B, 0x06, 0x01, 0x05, 0x05, 0x02];
 
 /// An OID as dotted decimal, for a message a human reads.
 ///
@@ -321,6 +330,18 @@ impl Registry {
     /// A registry with the Kerberos 5 mechanism, which is the one every deployment wants first.
     pub fn with_krb5() -> Self {
         Registry::new().register(Box::new(Krb5))
+    }
+
+    /// Everything this build has: Kerberos 5, then SPNEGO.
+    ///
+    /// **The order matters and is not arbitrary.** [`Self::first`] is what a caller that names no
+    /// mechanism gets, and SPNEGO is a wrapper: putting it first would wrap every context in a
+    /// negotiation nobody asked for, adding a round trip to each. It is selected when a peer's token
+    /// names its OID, which is exactly when a peer wants it — HTTP `Negotiate` and SMB.
+    pub fn all() -> Self {
+        Registry::new()
+            .register(Box::new(Krb5))
+            .register(Box::new(Spnego))
     }
 
     /// Adds `mechanism` at the end of the preference order.
@@ -597,6 +618,161 @@ impl Context for Accepting {
 
     fn per_message(&self) -> Result<&PerMessage, GssError> {
         self.per_message.as_ref().ok_or(GssError::NotEstablished)
+    }
+}
+
+/// The SPNEGO mechanism (RFC 4178): a negotiation wrapper whose tokens carry another mechanism's.
+///
+/// Its context holds the inner Kerberos context the negotiation produced, so everything after the
+/// handshake — names, flags, per-message tokens — is the Kerberos context's.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Spnego;
+
+impl Mechanism for Spnego {
+    fn name(&self) -> &'static str {
+        "spnego"
+    }
+
+    fn oids(&self) -> &'static [&'static [u8]] {
+        &[SPNEGO]
+    }
+
+    fn initiator(&self, creds: &Credentials, flags: u32) -> Result<Established, GssError> {
+        let (ctx, token) = SpnegoInitiator::new(creds, flags)?;
+        Ok((
+            Box::new(SpnegoInitiating {
+                inner: ctx,
+                per_message: OnceCell::new(),
+            }),
+            Some(token),
+        ))
+    }
+
+    fn accept(&self, keytab: &Keytab, token: &[u8]) -> Result<Established, GssError> {
+        let mut acc = SpnegoAcceptor::new();
+        let reply = acc.step(keytab, token)?;
+        // The keytab is copied into the context, and that is the price of not putting a lifetime on
+        // every `Context` in the crate: a SPNEGO exchange can take two rounds, and the second one
+        // may be the round that carries the Kerberos token. A keytab is a handful of keys, so the
+        // copy is small; it is a copy of secrets, which is why it is made here and nowhere else.
+        Ok((
+            Box::new(SpnegoAccepting {
+                inner: acc,
+                keytab: keytab.clone(),
+                per_message: OnceCell::new(),
+            }),
+            reply,
+        ))
+    }
+}
+
+/// The initiator side of a SPNEGO negotiation.
+#[derive(Debug)]
+struct SpnegoInitiating {
+    inner: SpnegoInitiator,
+    per_message: OnceCell<PerMessage>,
+}
+
+impl Context for SpnegoInitiating {
+    fn mechanism(&self) -> &'static str {
+        "spnego"
+    }
+
+    fn mech_oid(&self) -> &[u8] {
+        SPNEGO
+    }
+
+    fn step(&mut self, token: &[u8]) -> Result<Option<Vec<u8>>, GssError> {
+        Ok(self.inner.step(token)?)
+    }
+
+    fn is_established(&self) -> bool {
+        self.inner.is_established()
+    }
+
+    fn flags(&self) -> u32 {
+        self.inner.flags()
+    }
+
+    fn client(&self) -> Option<&str> {
+        None
+    }
+
+    fn service(&self) -> Option<&str> {
+        None
+    }
+
+    fn per_message(&self) -> Result<&PerMessage, GssError> {
+        if !self.is_established() {
+            return Err(GssError::NotEstablished);
+        }
+        if let Some(tokens) = self.per_message.get() {
+            return Ok(tokens);
+        }
+        let tokens = self.inner.per_message_tokens()?;
+        // **Not** the inner context's initial sequence number: the `mechListMIC`s consumed numbers,
+        // so the first per-message token continues from where negotiation left (RFC 4178 §5). The
+        // SPNEGO side is the only place that knows how many were spent.
+        let start = self.inner.send_seq();
+        Ok(self
+            .per_message
+            .get_or_init(|| PerMessage::new(tokens, start)))
+    }
+}
+
+/// The acceptor side of a SPNEGO negotiation.
+#[derive(Debug)]
+struct SpnegoAccepting {
+    inner: SpnegoAcceptor,
+    /// The keys, for a second round that carries the Kerberos token.
+    keytab: Keytab,
+    per_message: OnceCell<PerMessage>,
+}
+
+impl Context for SpnegoAccepting {
+    fn mechanism(&self) -> &'static str {
+        "spnego"
+    }
+
+    fn mech_oid(&self) -> &[u8] {
+        SPNEGO
+    }
+
+    fn step(&mut self, token: &[u8]) -> Result<Option<Vec<u8>>, GssError> {
+        Ok(self.inner.step(&self.keytab, token)?)
+    }
+
+    fn is_established(&self) -> bool {
+        self.inner.is_established()
+    }
+
+    fn flags(&self) -> u32 {
+        self.inner.context().map_or(0, |c| c.gss_flags)
+    }
+
+    fn client(&self) -> Option<&str> {
+        self.inner.context().map(|c| c.client_principal.as_str())
+    }
+
+    fn service(&self) -> Option<&str> {
+        self.inner.context().map(|c| c.service_principal.as_str())
+    }
+
+    fn per_message(&self) -> Result<&PerMessage, GssError> {
+        if !self.is_established() {
+            return Err(GssError::NotEstablished);
+        }
+        if let Some(tokens) = self.per_message.get() {
+            return Ok(tokens);
+        }
+        let ctx = self.inner.context().ok_or(GssError::NotEstablished)?;
+        let tokens = ctx.per_message_tokens()?;
+        // Where negotiation stopped, as above. The MIC exchange uses the context's counters, so the
+        // number the acceptor's next token carries is `send_seq`, not the Kerberos context's.
+        let start = self.inner.send_seq();
+        Ok(self
+            .per_message
+            .get_or_init(|| PerMessage::new(tokens, start)))
     }
 }
 

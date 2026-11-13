@@ -364,3 +364,133 @@ fn per_message_is_built_once_and_keeps_one_counter() {
         b"one"
     );
 }
+
+/// A server's registry: Kerberos first, SPNEGO second, and the OID list says so.
+///
+/// The order is the decision [`Registry::all`] documents. SPNEGO is a wrapper, so a caller that
+/// names no mechanism must not get one — it would pay a round trip for a negotiation nobody asked
+/// for.
+#[test]
+fn everything_this_build_has_lists_krb5_first_then_spnego() {
+    let registry = Registry::all();
+    assert_eq!(registry.len(), 2);
+    assert_eq!(
+        registry
+            .mechanisms()
+            .map(Mechanism::name)
+            .collect::<Vec<_>>(),
+        vec!["krb5", "spnego"]
+    );
+    assert_eq!(registry.indicate_mechs(), vec![KRB5, MS_KRB5, SPNEGO]);
+    assert_eq!(dotted_oid(SPNEGO).as_deref(), Some("1.3.6.1.5.5.2"));
+    assert_eq!(
+        registry.first().map(Mechanism::name),
+        Some("krb5"),
+        "a caller that names no mechanism gets Kerberos, not a wrapper"
+    );
+}
+
+/// One registry serves both kinds of client: the token's own OID decides, not a parameter.
+///
+/// That is the property an HTTP `Negotiate` endpoint needs — the same port answers a client that
+/// wraps Kerberos in SPNEGO and one that sends a bare Kerberos token.
+#[test]
+fn one_registry_serves_both_mechanisms() {
+    let (creds, keytab) = setup();
+    let registry = Registry::all();
+
+    // A bare Kerberos token: its OID is the mechanism's own, so it goes to `Krb5`.
+    let (_, bare) = registry
+        .initiator(Some(KRB5), &creds, GSS_C_MUTUAL_FLAG)
+        .expect("a kerberos context");
+    let (ctx, _) = registry
+        .acceptor(&keytab, &bare.expect("an AP-REQ"))
+        .expect("accepted");
+    assert_eq!(ctx.mechanism(), "krb5");
+
+    // A SPNEGO token: it goes to `Spnego`, and the context it yields is the negotiation's.
+    let (_, wrapped) = registry
+        .initiator(Some(SPNEGO), &creds, GSS_C_MUTUAL_FLAG)
+        .expect("a spnego context");
+    let (ctx, reply) = registry
+        .acceptor(&keytab, &wrapped.expect("a NegTokenInit"))
+        .expect("accepted");
+    assert_eq!(ctx.mechanism(), "spnego");
+    assert!(ctx.is_established(), "the optimistic token completed it");
+    assert_eq!(ctx.mech_oid(), SPNEGO);
+    assert_eq!(ctx.client(), Some("alice@EXAMPLE.COM"));
+    assert!(
+        reply.is_some(),
+        "the first answer always names the mechanism"
+    );
+}
+
+/// A full SPNEGO negotiation through the layer, both sides established and naming the client.
+#[test]
+fn a_spnego_negotiation_through_the_layer_establishes() {
+    let (creds, keytab) = setup();
+    let registry = Registry::all();
+
+    let (mut ini, token) = registry
+        .initiator(Some(SPNEGO), &creds, GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG)
+        .expect("a context");
+    assert!(!ini.is_established());
+
+    let (acc, reply) = registry
+        .acceptor(&keytab, &token.expect("a token"))
+        .expect("accepted");
+    assert!(acc.is_established());
+    assert_eq!(acc.client(), Some("alice@EXAMPLE.COM"));
+
+    // The initiator consumes the NegTokenResp and is established too.
+    let reply = reply.expect("a NegTokenResp");
+    assert!(ini.step(&reply).expect("consumed").is_none());
+    assert!(ini.is_established());
+    assert_ne!(ini.flags() & GSS_C_MUTUAL_FLAG, 0);
+}
+
+/// Per-message tokens work through a SPNEGO context, in both directions.
+///
+/// The number they start from is the **SPNEGO state's** `send_seq`, not the inner Kerberos
+/// context's: the `mechListMIC` exchange spends sequence numbers, so a context that resumed at the
+/// Kerberos numbers would reuse them. The two coincide in this exchange — our initiator offers
+/// Kerberos first, so no MIC is spent — and the case where they differ needs a peer that lists
+/// Kerberos second, which is built and pinned in `spnego::tests` (where `recv_seq`/`send_seq` are
+/// asserted around the MIC). What this test pins is the wiring: that the layer asks the SPNEGO state
+/// for the number at all, and that the tokens it produces are the ones the peer expects.
+#[test]
+fn per_message_through_a_negotiated_context_travels_both_ways() {
+    let (creds, keytab) = setup();
+    let registry = Registry::all();
+    let (mut ini, token) = registry
+        .initiator(
+            Some(SPNEGO),
+            &creds,
+            GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG | GSS_C_CONF_FLAG,
+        )
+        .expect("a context");
+    let (acc, reply) = registry
+        .acceptor(&keytab, &token.expect("a token"))
+        .expect("accepted");
+    ini.step(&reply.expect("a NegTokenResp")).expect("consumed");
+
+    let ti = ini.per_message().expect("keys after establishment");
+    let ta = acc.per_message().expect("keys after acceptance");
+    let asked = ti.next_send_seq();
+    let wrapped = ti.wrap(b"ping").expect("wrapped");
+    let got = ta.unwrap(&wrapped).expect("verified and decrypted");
+    assert_eq!(got.message, b"ping");
+    assert_eq!(
+        got.seq, asked,
+        "the token carries the number the context's counter was at"
+    );
+
+    let wrapped = ta.wrap(b"pong").expect("wrapped");
+    let got = ti.unwrap(&wrapped).expect("verified and decrypted");
+    assert_eq!(got.message, b"pong");
+
+    // A MIC over a message that stays readable, through the same negotiated context.
+    let mic = ti.mic(b"signed").expect("a MIC");
+    assert!(ta.verify_mic(&mic, b"signed").is_ok());
+    assert!(ta.verify_mic(&mic, b"other").is_err());
+}

@@ -17,6 +17,12 @@
 //! `is_established`. The acceptor also takes a bare Kerberos token, which
 //! some HTTP clients send under `Negotiate`, as MIT's does.
 //!
+//! **The acceptor takes the keytab per `step` and does not keep it.** A negotiation can run two
+//! rounds, and the round that carries the Kerberos token is not always the first — but holding a
+//! borrow across them would put a lifetime on the acceptor and on everything that holds one, which
+//! is why [`crate::gss`] needs its contexts to be lifetime-free. A caller that owns the keytab hands
+//! it over each time; the GSS layer copies it into the context, and says so there.
+//!
 //! The MICs use the context's sequence numbers, so after negotiation the
 //! next per-message token's sequence number is [`SpnegoInitiator::send_seq`]
 //! (or [`SpnegoAcceptor::send_seq`]), not the Kerberos context's initial
@@ -426,8 +432,7 @@ impl SpnegoInitiator {
 /// The acceptor side: `gss_accept_sec_context` for SPNEGO (and for a
 /// bare Kerberos token, as MIT's default acceptor credential takes both).
 #[derive(Debug)]
-pub struct SpnegoAcceptor<'k> {
-    keytab: &'k Keytab,
+pub struct SpnegoAcceptor {
     opts: AcceptOptions,
     started: bool,
     spnego: bool,
@@ -438,17 +443,27 @@ pub struct SpnegoAcceptor<'k> {
     established: bool,
 }
 
-impl<'k> SpnegoAcceptor<'k> {
-    /// An acceptor taking any key in `keytab`.
-    pub fn new(keytab: &'k Keytab) -> Self {
-        Self::with_options(keytab, AcceptOptions::default())
+impl Default for SpnegoAcceptor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpnegoAcceptor {
+    /// An acceptor taking any key in the keytab it is given per step.
+    ///
+    /// The keytab is **not** kept: a SPNEGO exchange can take several rounds, and holding a
+    /// borrow across them would put a lifetime on every context and on everything that holds one.
+    /// Taking it per `step` keeps the state machine self-contained and lets a caller replace or
+    /// reload its keytab between rounds — see [`SpnegoAcceptor::step`].
+    pub fn new() -> Self {
+        Self::with_options(AcceptOptions::default())
     }
 
     /// As [`SpnegoAcceptor::new`], with clock skew and channel bindings
     /// from `opts`.
-    pub fn with_options(keytab: &'k Keytab, opts: AcceptOptions) -> Self {
+    pub fn with_options(opts: AcceptOptions) -> Self {
         SpnegoAcceptor {
-            keytab,
             opts,
             started: false,
             spnego: false,
@@ -467,10 +482,16 @@ impl<'k> SpnegoAcceptor<'k> {
         }
     }
 
-    /// Process a token from the initiator. Returns the token to send back,
-    /// if there is one; [`Self::is_established`] says whether negotiation
-    /// is over.
-    pub fn step(&mut self, token: &[u8]) -> Result<Option<Vec<u8>>, KerberosError> {
+    /// Process a token from the initiator, accepting Kerberos tokens with `keytab`.
+    ///
+    /// Returns the token to send back, if there is one; [`Self::is_established`] says whether
+    /// negotiation is over. `keytab` is used only on the round that carries a Kerberos token, which
+    /// is the first round in the optimistic case and the second when the initiator negotiated.
+    pub fn step(
+        &mut self,
+        keytab: &Keytab,
+        token: &[u8],
+    ) -> Result<Option<Vec<u8>>, KerberosError> {
         let bad = |m: String| KerberosError::Negotiation(m);
         if self.established {
             return Err(bad("context is already established".into()));
@@ -479,14 +500,13 @@ impl<'k> SpnegoAcceptor<'k> {
             self.started = true;
             if is_krb5_token(token) {
                 // A bare Kerberos token, no negotiation.
-                let (ctx, ap_rep) =
-                    KerberosContext::accept_token_with(self.keytab, token, &self.opts)?;
+                let (ctx, ap_rep) = KerberosContext::accept_token_with(keytab, token, &self.opts)?;
                 self.ctx = Some(ctx);
                 self.established = true;
                 return Ok((!ap_rep.is_empty()).then_some(ap_rep));
             }
             self.spnego = true;
-            return self.first(token);
+            return self.first(keytab, token);
         }
         // MIT's acc_ctx_cont.
         let resp = parse_resp(token).map_err(bad)?;
@@ -504,14 +524,14 @@ impl<'k> SpnegoAcceptor<'k> {
             if self.ctx.is_some() {
                 return Err(bad("a Kerberos token after Kerberos completed".into()));
             }
-            ap_rep = self.accept(t, &mut neg_state)?;
+            ap_rep = self.accept(keytab, t, &mut neg_state)?;
         }
         let out = self.finish(resp.mic, &ap_rep, neg_state)?;
         Ok(out.map(|(state, mic)| encode_resp(state, None, Some(&ap_rep), mic.as_deref())))
     }
 
     /// MIT's acc_ctx_new and the rest of the first pass.
-    fn first(&mut self, token: &[u8]) -> Result<Option<Vec<u8>>, KerberosError> {
+    fn first(&mut self, keytab: &Keytab, token: &[u8]) -> Result<Option<Vec<u8>>, KerberosError> {
         let bad = |m: String| KerberosError::Negotiation(m);
         let init = parse_init(token).map_err(bad)?;
         // MIT's negotiate_mech: the initiator's first mechanism we
@@ -530,7 +550,7 @@ impl<'k> SpnegoAcceptor<'k> {
         let mut ap_rep = Vec::new();
         // With request-mic the optimistic token was for another mechanism.
         if let (Some(t), false) = (init.mech_token, neg_state == REQUEST_MIC) {
-            ap_rep = self.accept(t, &mut neg_state)?;
+            ap_rep = self.accept(keytab, t, &mut neg_state)?;
         }
         let state = match self.finish(init.mic, &ap_rep, neg_state)? {
             Some((s, mic)) => (s, mic),
@@ -546,8 +566,13 @@ impl<'k> SpnegoAcceptor<'k> {
     }
 
     /// MIT's acc_ctx_call_acc: the Kerberos exchange.
-    fn accept(&mut self, token: &[u8], neg_state: &mut u8) -> Result<Vec<u8>, KerberosError> {
-        let (ctx, ap_rep) = KerberosContext::accept_token_with(self.keytab, token, &self.opts)?;
+    fn accept(
+        &mut self,
+        keytab: &Keytab,
+        token: &[u8],
+        neg_state: &mut u8,
+    ) -> Result<Vec<u8>, KerberosError> {
+        let (ctx, ap_rep) = KerberosContext::accept_token_with(keytab, token, &self.opts)?;
         self.mic.send_seq = ctx.acceptor_seq.into();
         self.mic.recv_seq = ctx.initiator_seq.into();
         self.mic.check_seq = ctx.gss_flags & (GSS_C_REPLAY_FLAG | GSS_C_SEQUENCE_FLAG) != 0;

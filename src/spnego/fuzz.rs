@@ -44,9 +44,9 @@ pub fn tokens(data: &[u8]) {
                 enctype: EncType::AES256CtsHmacSha196,
                 key: vec![7; 32],
             }]);
-            let mut acc = SpnegoAcceptor::new(&kt);
+            let mut acc = SpnegoAcceptor::new();
             for t in toks {
-                if acc.step(t).is_err() {
+                if acc.step(&kt, t).is_err() {
                     break;
                 }
             }

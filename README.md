@@ -130,7 +130,9 @@ tickets without shelling out to `kinit`.
   OID inside the peer's token, so one port serves clients that ask differently.
   `indicate_mechs` lists what the build has; the Microsoft OID is registered as
   an alias of the same mechanism, not a second one. Per-message wrap/mic hang off
-  the context instead of a second type the caller has to construct.
+  the context instead of a second type the caller has to construct. SPNEGO is
+  registered as a mechanism too (`Registry::all()`), so one port answers a client
+  that wraps Kerberos and one that sends it bare — the token's own OID decides.
 - **SPNEGO** (RFC 4178) — both sides, for HTTP `Negotiate`, SMB, LDAP
   and Windows peers: Kerberos 5 under its own OID or Microsoft's,
   `mechListMIC`s exchanged when MIT would exchange them, and a bare

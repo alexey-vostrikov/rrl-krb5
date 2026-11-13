@@ -31,7 +31,7 @@ fn fresh() -> AcceptOptions {
 }
 
 /// Wrap tokens both ways at the sequence numbers negotiation left.
-fn exchange(ini: &SpnegoInitiator, acc: &SpnegoAcceptor<'_>) {
+fn exchange(ini: &SpnegoInitiator, acc: &SpnegoAcceptor) {
     let ti = ini.per_message_tokens().unwrap();
     let ta = acc.context().unwrap().per_message_tokens().unwrap();
     let w = ti.emit_wrap(ini.send_seq(), b"ping").unwrap();
@@ -56,8 +56,8 @@ fn mutual_authentication_takes_one_round_trip_and_no_mics() {
     assert_eq!(init.mechs, [KRB5_MECH_OID.to_vec()]);
     assert!(init.mic.is_none());
 
-    let mut acc = SpnegoAcceptor::new(&keytab);
-    let reply = acc.step(&token).unwrap().expect("a NegTokenResp");
+    let mut acc = SpnegoAcceptor::new();
+    let reply = acc.step(&keytab, &token).unwrap().expect("a NegTokenResp");
     assert!(acc.is_established() && acc.is_spnego());
     let resp = parse_resp(&reply).unwrap();
     assert_eq!(resp.neg_state, Some(ACCEPT_COMPLETED));
@@ -85,8 +85,8 @@ fn without_mutual_authentication_the_acceptor_still_answers() {
     let (creds, keytab) = setup();
     let (mut ini, token) = SpnegoInitiator::new(&creds, GSS_C_CONF_FLAG).unwrap();
     assert!(!ini.is_established());
-    let mut acc = SpnegoAcceptor::new(&keytab);
-    let reply = acc.step(&token).unwrap().unwrap();
+    let mut acc = SpnegoAcceptor::new();
+    let reply = acc.step(&keytab, &token).unwrap().unwrap();
     let resp = parse_resp(&reply).unwrap();
     assert_eq!(resp.neg_state, Some(ACCEPT_COMPLETED));
     assert!(resp.response_token.is_none());
@@ -108,8 +108,8 @@ fn microsofts_kerberos_oid_is_kerberos() {
         NTLM_OID.to_vec(),
     ]);
     let token = encode_init(&mech_types, &krb5_token, None);
-    let mut acc = SpnegoAcceptor::new(&keytab);
-    let reply = acc.step(&token).unwrap().unwrap();
+    let mut acc = SpnegoAcceptor::new();
+    let reply = acc.step(&keytab, &token).unwrap().unwrap();
     let resp = parse_resp(&reply).unwrap();
     assert_eq!(resp.supported_mech, Some(&MS_KRB5_OID[..]));
     assert_eq!(resp.neg_state, Some(ACCEPT_COMPLETED));
@@ -142,8 +142,8 @@ fn kerberos_second_in_the_list_needs_mics_both_ways() {
         InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG | GSS_C_INTEG_FLAG).unwrap();
     let mech_types = der::seq(&[NTLM_OID.to_vec(), KRB5_MECH_OID.to_vec()]);
     let token = encode_init(&mech_types, b"NTLMSSP\0...", None);
-    let mut acc = SpnegoAcceptor::new(&keytab);
-    let r = parse_resp(&acc.step(&token).unwrap().unwrap())
+    let mut acc = SpnegoAcceptor::new();
+    let r = parse_resp(&acc.step(&keytab, &token).unwrap().unwrap())
         .map(|r| {
             (
                 r.neg_state,
@@ -157,7 +157,10 @@ fn kerberos_second_in_the_list_needs_mics_both_ways() {
 
     // The Kerberos token, now; the acceptor answers with its MIC.
     let reply = acc
-        .step(&encode_resp(ACCEPT_INCOMPLETE, None, Some(&ap_req), None))
+        .step(
+            &keytab,
+            &encode_resp(ACCEPT_INCOMPLETE, None, Some(&ap_req), None),
+        )
         .unwrap()
         .unwrap();
     let resp = parse_resp(&reply).unwrap();
@@ -170,25 +173,34 @@ fn kerberos_second_in_the_list_needs_mics_both_ways() {
 
     // A forged MIC is refused; the real one finishes it.
     let mic = tokens.emit_mic(krb5.send_seq(), &mech_types).unwrap();
-    let mut probe = SpnegoAcceptor::with_options(&keytab, fresh());
-    probe.step(&token).unwrap();
+    let mut probe = SpnegoAcceptor::with_options(fresh());
+    probe.step(&keytab, &token).unwrap();
     probe
-        .step(&encode_resp(ACCEPT_INCOMPLETE, None, Some(&ap_req), None))
+        .step(
+            &keytab,
+            &encode_resp(ACCEPT_INCOMPLETE, None, Some(&ap_req), None),
+        )
         .unwrap();
     let mut forged = mic.clone();
     forged[20] ^= 1;
     let e = probe
-        .step(&encode_resp(ACCEPT_INCOMPLETE, None, None, Some(&forged)))
+        .step(
+            &keytab,
+            &encode_resp(ACCEPT_INCOMPLETE, None, None, Some(&forged)),
+        )
         .unwrap_err();
     assert!(matches!(e, KerberosError::Negotiation(_)), "{e}");
     // Nothing at all is not a token.
     assert!(
         probe
-            .step(&encode_resp(ACCEPT_INCOMPLETE, None, None, None))
+            .step(&keytab, &encode_resp(ACCEPT_INCOMPLETE, None, None, None))
             .is_err()
     );
     let last = acc
-        .step(&encode_resp(ACCEPT_INCOMPLETE, None, None, Some(&mic)))
+        .step(
+            &keytab,
+            &encode_resp(ACCEPT_INCOMPLETE, None, None, Some(&mic)),
+        )
         .unwrap();
     assert_eq!(last, None, "MICs crossed; nothing more to say");
     assert!(acc.is_established());
@@ -202,8 +214,8 @@ fn kerberos_second_in_the_list_needs_mics_both_ways() {
 fn an_acceptor_mic_is_answered_and_checked() {
     let (creds, keytab) = setup();
     let (mut ini, token) = SpnegoInitiator::new(&creds, GSS_C_MUTUAL_FLAG).unwrap();
-    let mut acc = SpnegoAcceptor::new(&keytab);
-    let reply = acc.step(&token).unwrap().unwrap();
+    let mut acc = SpnegoAcceptor::new();
+    let reply = acc.step(&keytab, &token).unwrap().unwrap();
     let resp = parse_resp(&reply).unwrap();
     let ctx = acc.context().unwrap();
     let mech_types = der::seq(&[KRB5_MECH_OID.to_vec()]);
@@ -262,30 +274,32 @@ fn channel_bindings_ride_through_spnego() {
     };
 
     // Matching: bound.
-    let mut acc = SpnegoAcceptor::with_options(&keytab, opts(Some(ours.clone())));
-    acc.step(&init(Some(&ours), 0)).unwrap();
+    let mut acc = SpnegoAcceptor::with_options(opts(Some(ours.clone())));
+    acc.step(&keytab, &init(Some(&ours), 0)).unwrap();
     assert_ne!(
         acc.context().unwrap().gss_flags & GSS_C_CHANNEL_BOUND_FLAG,
         0
     );
     // Different: refused.
-    let mut acc = SpnegoAcceptor::with_options(&keytab, opts(Some(ours.clone())));
-    let e = acc.step(&init(Some(&theirs), 0)).unwrap_err();
+    let mut acc = SpnegoAcceptor::with_options(opts(Some(ours.clone())));
+    let e = acc.step(&keytab, &init(Some(&theirs), 0)).unwrap_err();
     assert!(matches!(e, KerberosError::BadBindings(_)), "{e}");
     // None sent: accepted, not bound...
-    let mut acc = SpnegoAcceptor::with_options(&keytab, opts(Some(ours.clone())));
-    acc.step(&init(None, 0)).unwrap();
+    let mut acc = SpnegoAcceptor::with_options(opts(Some(ours.clone())));
+    acc.step(&keytab, &init(None, 0)).unwrap();
     assert_eq!(
         acc.context().unwrap().gss_flags & GSS_C_CHANNEL_BOUND_FLAG,
         0
     );
     // ...unless the initiator said it binds (KERB_AP_OPTIONS_CBT).
-    let mut acc = SpnegoAcceptor::with_options(&keytab, opts(Some(ours.clone())));
-    let e = acc.step(&init(None, GSS_C_CHANNEL_BOUND_FLAG)).unwrap_err();
+    let mut acc = SpnegoAcceptor::with_options(opts(Some(ours.clone())));
+    let e = acc
+        .step(&keytab, &init(None, GSS_C_CHANNEL_BOUND_FLAG))
+        .unwrap_err();
     assert!(matches!(e, KerberosError::BadBindings(_)), "{e}");
     // An acceptor without bindings ignores them, CBT or not.
-    let mut acc = SpnegoAcceptor::new(&keytab);
-    acc.step(&init(Some(&theirs), GSS_C_CHANNEL_BOUND_FLAG))
+    let mut acc = SpnegoAcceptor::new();
+    acc.step(&keytab, &init(Some(&theirs), GSS_C_CHANNEL_BOUND_FLAG))
         .unwrap();
     assert!(acc.is_established());
 }
@@ -294,8 +308,8 @@ fn channel_bindings_ride_through_spnego() {
 fn a_bare_kerberos_token_needs_no_negotiation() {
     let (creds, keytab) = setup();
     let (mut krb5, token) = InitiatorContext::new(&creds, GSS_C_MUTUAL_FLAG).unwrap();
-    let mut acc = SpnegoAcceptor::new(&keytab);
-    let ap_rep = acc.step(&token).unwrap().expect("an AP-REP");
+    let mut acc = SpnegoAcceptor::new();
+    let ap_rep = acc.step(&keytab, &token).unwrap().expect("an AP-REP");
     assert!(acc.is_established() && !acc.is_spnego());
     krb5.step(&ap_rep).unwrap();
 }
@@ -304,7 +318,7 @@ fn a_bare_kerberos_token_needs_no_negotiation() {
 fn no_kerberos_on_offer_is_a_negotiation_failure() {
     let (_, keytab) = setup();
     let token = encode_init(&der::seq(&[NTLM_OID.to_vec()]), b"NTLMSSP", None);
-    let e = SpnegoAcceptor::new(&keytab).step(&token).unwrap_err();
+    let e = SpnegoAcceptor::new().step(&keytab, &token).unwrap_err();
     assert!(matches!(e, KerberosError::Negotiation(_)), "{e}");
     // A reject from the acceptor ends the initiator too.
     let (creds, _) = setup();

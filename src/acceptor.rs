@@ -143,7 +143,12 @@ impl ServiceKey {
 }
 
 /// Kerberos keytab
-#[derive(Debug)]
+///
+/// `Clone` because a GSS mechanism may need the keys past the call that handed them over: the
+/// SPNEGO acceptor takes them per step (its exchange can be two rounds), and the adapter that holds
+/// one across steps owns a copy. A keytab is a handful of keys, so the copy is small — but it is a
+/// copy of secrets, and the reason it exists is written at the one place that makes it.
+#[derive(Debug, Clone)]
 pub struct Keytab {
     keys: Vec<ServiceKey>,
 }
