@@ -123,6 +123,14 @@ tickets without shelling out to `kinit`.
   RFC 4121 checksum) and AP-REP verification, including acceptor subkeys;
   delegation of a forwarded TGT (`GSS_C_DELEG_FLAG`), which the acceptor
   receives and can use.
+- **GSS-API mechanism layer** — `gss::Registry`, `gss::Mechanism`, `gss::Context`:
+  an application holds `Box<dyn Context>` and never learns which mechanism
+  authenticated the connection. `gss_init_sec_context`/`gss_accept_sec_context`
+  are `Registry::initiator`/`Registry::acceptor`; the acceptor dispatches on the
+  OID inside the peer's token, so one port serves clients that ask differently.
+  `indicate_mechs` lists what the build has; the Microsoft OID is registered as
+  an alias of the same mechanism, not a second one. Per-message wrap/mic hang off
+  the context instead of a second type the caller has to construct.
 - **SPNEGO** (RFC 4178) — both sides, for HTTP `Negotiate`, SMB, LDAP
   and Windows peers: Kerberos 5 under its own OID or Microsoft's,
   `mechListMIC`s exchanged when MIT would exchange them, and a bare

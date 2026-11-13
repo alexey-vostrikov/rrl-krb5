@@ -123,6 +123,7 @@ mod der;
 #[cfg(test)]
 mod differential; // every one of the above, against rrl-crypto, on the same inputs
 pub mod dns; // KDC discovery: URI and SRV records, stub resolver
+pub mod gss; // the GSS-API mechanism layer: one interface over whichever mechanism authenticates
 pub mod initiator;
 pub mod kadmin; // kadmind's kadm5 RPC protocol: what kadmin does
 mod kdf; // RFC 3961 §5.1 DR/DK, RFC 3962 §4, RFC 8009 §3
