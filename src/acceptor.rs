@@ -1382,7 +1382,6 @@ impl EncAPRepPart {
     /// Encrypt and return as EncryptedData
     fn encrypt(&self, session_key: &SessionKey) -> Result<Vec<u8>> {
         let plaintext = self.encode_asn1();
-
         // RFC 3961 §5.3: a random confounder, and the HMAC APPENDED to
         // the ciphertext rather than sealed inside it.
         let ciphertext = spec_encrypt(
@@ -2393,6 +2392,11 @@ impl KerberosContext {
         // session key — and until now it was always the latter.
         let (base_key, base_key_enctype, used_initiator_subkey) =
             select_base_key(&session_key, authenticator.subkey.as_ref());
+        // Kept for the AP-REP, which is built after `base_key` moves into the context below.
+        let ap_rep_key = SessionKey {
+            enctype: base_key_enctype,
+            key: base_key.clone(),
+        };
         if used_initiator_subkey {
             info!("   Adopting the initiator's subkey as the per-message base key");
         }
@@ -2461,8 +2465,18 @@ impl KerberosContext {
         // to nothing else. Sending one unasked breaks the initiator, which
         // is already established and rejects the extra token.
         let ap_rep = if mutual {
+            // RFC 4120 §5.5.2: the AP-REP's `enc-part` is encrypted in the session key from the
+            // ticket **unless the authenticator carried a subkey**, in which case it is the subkey.
+            // MIT's initiator decrypts with its subkey, because that is what its `auth_context`
+            // holds after reading the authenticator, so an AP-REP sealed under the ticket key
+            // decrypts to noise there.
+            //
+            // Measured on the AD-join stand: `ldapsearch -Y GSSAPI -Q` against this server answered
+            // "ASN.1 structure is missing a required field" - the error of a decoder handed bytes
+            // that are not the structure at all - while `smbclient -k` and `wldap32` were content,
+            // which is why this went unnoticed for as long as it did.
             Self::generate_ap_rep_with_crypto(
-                &session_key,
+                &ap_rep_key,
                 authenticator.ctime,
                 authenticator.cusec,
                 oid,

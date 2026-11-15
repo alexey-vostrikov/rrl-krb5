@@ -260,9 +260,22 @@ impl InitiatorContext {
             }
         };
         let (_, cipher) = decode_encrypted_data(Reader::new(enc))?;
-        // RFC 4120 §5.5.2: the AP-REP is sealed with the ticket session
-        // key, never a subkey.
-        let plain = self.session_key.decrypt(KU_AP_REP_ENC_PART, &cipher)?;
+        // The AP-REP is sealed with **our subkey**, because the authenticator carried one: MIT's
+        // acceptor encrypts with whatever its `auth_context` holds after reading the authenticator,
+        // and with a subkey present that is the subkey, not the ticket's session key. RFC 4120
+        // §5.5.2 is read both ways by implementations; the reading that interoperates is this one.
+        //
+        // Measured on the AD-join stand: `ldapsearch -Y GSSAPI -Q` against a server that sealed the
+        // AP-REP under the ticket key answered "ASN.1 structure is missing a required field" - the
+        // complaint of a decoder handed noise - while clients that did not send a subkey were
+        // content. The session key stays as the fallback for an acceptor that does not use it.
+        let plain = match self.subkey.decrypt(KU_AP_REP_ENC_PART, &cipher) {
+            Ok(plain) => plain,
+            Err(first) => self
+                .session_key
+                .decrypt(KU_AP_REP_ENC_PART, &cipher)
+                .map_err(|_| first)?,
+        };
         // `[APPLICATION 27]` replaces the SEQUENCE tag (implicit, as Kerberos tags it), so the
         // fields follow the application tag directly; the explicit form is read too, because this
         // stack emitted it once.
