@@ -1367,12 +1367,11 @@ impl EncAPRepPart {
             content.extend_from_slice(&seq_bytes);
         }
 
-        // Wrap in SEQUENCE
+        // Wrap in SEQUENCE and then in APPLICATION 27: the module is `DEFINITIONS EXPLICIT TAGS`.
         let mut seq = vec![0x30];
         KerberosContext::encode_length(&mut seq, content.len());
         seq.extend_from_slice(&content);
 
-        // Wrap in APPLICATION 27
         let mut result = vec![0x7B]; // APPLICATION 27
         KerberosContext::encode_length(&mut result, seq.len());
         result.extend_from_slice(&seq);
@@ -2598,22 +2597,28 @@ impl KerberosContext {
         // Build AP-REP: [APPLICATION 15] SEQUENCE {
         //   pvno[0] INTEGER (5),
         //   msg-type[1] INTEGER (15),
-        //   enc-part[2] EncryptedData
+        //   enc-part EncryptedData
         // }
+        //
+        // `enc-part` is **untagged** (RFC 4120 §5.9.2): the field is an `EncryptedData`, which is
+        // already a SEQUENCE, and only `pvno` and `msg-type` carry context tags. Emitting it as
+        // `[2]` - the shape `TGS-REP` uses for its own `enc-part` - produces an AP-REP that a MIT or
+        // Samba initiator refuses while reading it: measured, `smbclient -k` answered "ASN.1
+        // identifier doesn't match expected value" for an AP-REP whose pvno, msg-type and cipher were
+        // all correct, because the identifier it met was `a2` where the EncryptedData begins.
         let mut ap_rep_content = vec![
             0xA0, 0x03, 0x02, 0x01, 0x05, // pvno[0] = 5
             0xA1, 0x03, 0x02, 0x01, 0x0F, // msg-type[1] = 15
-            0xA2, // enc-part[2]
         ];
-        Self::encode_length(&mut ap_rep_content, encrypted.len());
         ap_rep_content.extend_from_slice(&encrypted);
 
-        // Wrap in SEQUENCE
+        // Wrap in SEQUENCE and then in APPLICATION 15. RFC 4120's ASN.1 module is
+        // `DEFINITIONS EXPLICIT TAGS`, so the application tag wraps the SEQUENCE rather than
+        // replacing it: `6f <len> 30 <len> <fields>`.
         let mut ap_rep_seq = vec![0x30];
         Self::encode_length(&mut ap_rep_seq, ap_rep_content.len());
         ap_rep_seq.extend_from_slice(&ap_rep_content);
 
-        // Wrap in APPLICATION 15
         let mut ap_rep = vec![0x6F];
         Self::encode_length(&mut ap_rep, ap_rep_seq.len());
         ap_rep.extend_from_slice(&ap_rep_seq);
@@ -3272,7 +3277,18 @@ mod tests {
     fn the_ap_rep_echoes_every_cusec_exactly() {
         for cusec in [128u32, 200, 255, 32_768, 65_535] {
             let part = EncAPRepPart::create(1_790_000_000, cusec, None).encode_asn1();
-            let f = crate::der::Fields::parse_tagged("EncAPRepPart", 0x7B, &part).unwrap();
+            // The fields follow the application tag directly: this stack emits the implicit form,
+            // which is what RFC 4120's `[APPLICATION 27] SEQUENCE` means once the tag is applied.
+            let mut outer = crate::der::Reader::new(&part);
+            let content = outer.expect_in("EncAPRepPart", 0x7B).unwrap();
+            let content = if content.first() == Some(&0x30) {
+                crate::der::Reader::new(content)
+                    .expect_in("EncAPRepPart", 0x30)
+                    .unwrap()
+            } else {
+                content
+            };
+            let f = crate::der::Fields::parse("EncAPRepPart", content).unwrap();
             assert_eq!(f.get(1).unwrap().u32().unwrap(), cusec);
         }
     }

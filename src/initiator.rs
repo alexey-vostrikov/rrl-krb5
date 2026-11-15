@@ -18,7 +18,7 @@ use crate::client::{
     ClientError, Credentials, KrbError, Result, decode_encrypted_data, decode_key, encode_ap_req,
     encode_authenticator,
 };
-use crate::der::{self, Fields, app};
+use crate::der::{self, Fields, Reader, app};
 use crate::key::Key;
 use crate::token::{ContextKey, PerMessageTokens, Role};
 use rand::RngCore;
@@ -221,17 +221,59 @@ impl InitiatorContext {
             }
         }
 
-        let f = Fields::parse_tagged("AP-REP", app(15), inner)?;
-        if f.get(0)?.int()? != 5 || f.get(1)?.int()? != 15 {
+        // RFC 4120 §5.9.2: `AP-REP ::= [APPLICATION 15] SEQUENCE { pvno [0], msg-type [1],
+        // enc-part EncryptedData }`, and `enc-part` is **untagged** because it is already a
+        // SEQUENCE. Read by hand rather than through `Fields`, which addresses a field by its
+        // context number and so cannot name one that has none.
+        //
+        // The `[2]`-tagged form is accepted as well: this crate emitted it once, and a peer built
+        // from that version means the same thing by it.
+        let mut outer = Reader::new(inner);
+        let seq = outer.expect_in("AP-REP", app(15))?;
+        // `[APPLICATION 15]` replaces the SEQUENCE tag (Kerberos tags application values implicitly),
+        // so the fields follow the application tag directly. A producer that wrapped them in an
+        // explicit SEQUENCE as well is read too - this stack emits that form, and MIT accepts it.
+        let fields = if seq.first() == Some(&der::SEQUENCE) {
+            Reader::new(seq).expect_in("AP-REP", der::SEQUENCE)?
+        } else {
+            seq
+        };
+        let mut f = Reader::new(fields);
+        let pvno = Reader::new(f.expect_in("AP-REP pvno", der::ctx(0))?).int()?;
+        let msg_type = Reader::new(f.expect_in("AP-REP msg-type", der::ctx(1))?).int()?;
+        if pvno != 5 || msg_type != 15 {
             return Err(ClientError::Protocol(
                 "AP-REP pvno/msg-type mismatch".into(),
             ));
         }
-        let (_, cipher) = decode_encrypted_data(f.get(2)?)?;
+        // Where the field starts, so that an untagged `EncryptedData` can be handed over whole: the
+        // decoder wants a reader positioned at the SEQUENCE, and `next_tlv` has consumed it.
+        let enc_from = f.rest();
+        let enc_part = f.next_tlv("AP-REP enc-part")?;
+        let enc = match enc_part.tag {
+            der::SEQUENCE => enc_from,
+            tag if tag == der::ctx(2) => enc_part.content,
+            other => {
+                return Err(ClientError::Protocol(format!(
+                    "AP-REP enc-part: unexpected tag 0x{other:02x}"
+                )));
+            }
+        };
+        let (_, cipher) = decode_encrypted_data(Reader::new(enc))?;
         // RFC 4120 §5.5.2: the AP-REP is sealed with the ticket session
         // key, never a subkey.
         let plain = self.session_key.decrypt(KU_AP_REP_ENC_PART, &cipher)?;
-        let p = Fields::parse_tagged("EncAPRepPart", app(27), &plain)?;
+        // `[APPLICATION 27]` replaces the SEQUENCE tag (implicit, as Kerberos tags it), so the
+        // fields follow the application tag directly; the explicit form is read too, because this
+        // stack emitted it once.
+        let mut enc_reader = Reader::new(&plain);
+        let enc_fields = enc_reader.expect_in("EncAPRepPart", app(27))?;
+        let enc_fields = if enc_fields.first() == Some(&der::SEQUENCE) {
+            Reader::new(enc_fields).expect_in("EncAPRepPart", der::SEQUENCE)?
+        } else {
+            enc_fields
+        };
+        let p = Fields::parse("EncAPRepPart", enc_fields)?;
 
         // The echo of our own ctime/cusec is the acceptor's proof that it
         // decrypted the authenticator: that IS mutual authentication.
