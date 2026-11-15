@@ -1367,7 +1367,11 @@ impl EncAPRepPart {
             content.extend_from_slice(&seq_bytes);
         }
 
-        // Wrap in SEQUENCE and then in APPLICATION 27: the module is `DEFINITIONS EXPLICIT TAGS`.
+        // `[APPLICATION 27]` wraps a SEQUENCE, explicitly: this is what MIT emits for every
+        // application wrapper — its own AP-REQ is `6e <len> 30 <len> …`, and its AP-REP likewise.
+        // Taken from MIT's output for this realm rather than from the ASN.1 module, because the
+        // module's `DEFINITIONS EXPLICIT TAGS` is read differently by different stacks and the
+        // decoder, not the module, decides.
         let mut seq = vec![0x30];
         KerberosContext::encode_length(&mut seq, content.len());
         seq.extend_from_slice(&content);
@@ -2624,11 +2628,22 @@ impl KerberosContext {
             0xA0, 0x03, 0x02, 0x01, 0x05, // pvno[0] = 5
             0xA1, 0x03, 0x02, 0x01, 0x0F, // msg-type[1] = 15
         ];
+        // `enc-part` carries a `[2]` tag around the `EncryptedData` SEQUENCE — MIT's choice, and
+        // the shape its own acceptor emits; see the note below where the reply is wrapped.
+        ap_rep_content.push(0xA2);
+        Self::encode_length(&mut ap_rep_content, encrypted.len());
         ap_rep_content.extend_from_slice(&encrypted);
 
-        // Wrap in SEQUENCE and then in APPLICATION 15. RFC 4120's ASN.1 module is
-        // `DEFINITIONS EXPLICIT TAGS`, so the application tag wraps the SEQUENCE rather than
-        // replacing it: `6f <len> 30 <len> <fields>`.
+        // The shape MIT emits, octet for octet, taken from its own acceptor on this realm:
+        //
+        //     6f 81 89 30 81 86 a0 03 02 01 05 a1 03 02 01 0f a2 7a 30 78 a0 03 02 01 12 a2 71 04 6f …
+        //     [APPLICATION 15] { SEQUENCE { pvno, msg-type, [2] { EncryptedData } } }
+        //
+        // Two things there are not what RFC 4120 §5.9.2 says and both are load-bearing: the
+        // application tag wraps a SEQUENCE (explicit), and `enc-part` carries the `[2]` tag. Our
+        // earlier forms — implicit tag, untagged enc-part — are what a MIT client answered with
+        // "ASN.1 structure is missing a required field" and "ASN.1 length doesn't match expected
+        // value" respectively, and no amount of trying the four combinations got past it.
         let mut ap_rep_seq = vec![0x30];
         Self::encode_length(&mut ap_rep_seq, ap_rep_content.len());
         ap_rep_seq.extend_from_slice(&ap_rep_content);

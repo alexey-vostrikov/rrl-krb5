@@ -230,6 +230,13 @@ impl InitiatorContext {
         // from that version means the same thing by it.
         let mut outer = Reader::new(inner);
         let seq = outer.expect_in("AP-REP", app(15))?;
+        // `[APPLICATION 15]` carries the fields directly, as every implementation writes it; the
+        // explicit form with a SEQUENCE inside is read too, because this stack emitted it once.
+        let seq = if seq.first() == Some(&der::SEQUENCE) {
+            Reader::new(seq).expect_in("AP-REP", der::SEQUENCE)?
+        } else {
+            seq
+        };
         // `[APPLICATION 15]` replaces the SEQUENCE tag (Kerberos tags application values implicitly),
         // so the fields follow the application tag directly. A producer that wrapped them in an
         // explicit SEQUENCE as well is read too - this stack emits that form, and MIT accepts it.
