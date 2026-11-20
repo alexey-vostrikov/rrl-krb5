@@ -994,7 +994,19 @@ mod tests {
         }
     }
 
+    /// Not a test: it asserts nothing and writes a file, so it stayed green while checking nothing.
+    ///
+    /// It was also the one test that broke the mutation run outright. `cargo-mutants` refuses to
+    /// start unless the baseline passes, and this panicked with `NotFound` under a worktree whose
+    /// `target/` does not exist: the path is relative, and cargo builds into `CARGO_TARGET_DIR`,
+    /// not into `./target`. A refusal to start reads as a broken crate, so one debug helper was
+    /// hiding 5 443 mutants behind it.
+    ///
+    /// `#[ignore]` rather than a deletion: the dump is genuinely useful when debugging CMS
+    /// verification by hand. A helper that asserts nothing belongs outside the suite that decides
+    /// whether the code is correct.
     #[test]
+    #[ignore = "writes a debug dump and asserts nothing; run it by hand when debugging CMS"]
     fn dump_authpack_hex() {
         let id = rsa_identity();
         let inp = input(b"body", Some(&id));
@@ -1010,7 +1022,12 @@ mod tests {
         )
         .unwrap()
         .content;
-        std::fs::write("target/authpack.der", &ap).unwrap();
+        // Absolute, and the directory is created: `target/` exists only when cargo was allowed to
+        // build in-tree, and under `CARGO_TARGET_DIR` it does not.
+        let out = std::env::var("AUTHPACK_OUT")
+            .unwrap_or_else(|_| "authpack.der".to_string());
+        std::fs::write(&out, &ap).unwrap();
+        eprintln!("authpack written to {out}");
     }
 
     /// The KDC's half of the exchange `req` opened: its public value (the
