@@ -5,6 +5,7 @@
 use super::asn1;
 use crate::client::Principal;
 use crate::der;
+use rrl_crypto::KdfHash;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
 
@@ -83,30 +84,19 @@ pub(crate) fn other_info(
     ])
 }
 
-/// SP 800-56A single-step KDF: `H(counter || Z || OtherInfo)` for a
-/// 32-bit big-endian counter from 1, concatenated and truncated. `None`
-/// for a KDF not in [`OFFERED`].
+/// SP 800-56A single-step KDF: `H(counter || Z || OtherInfo)`, counters from 1, truncated.
+///
+/// The construction lives in `rrl-crypto` (RRL-7.8), beside the SP 800-108 one: both are
+/// counter-mode KDFs, both were written here first, and a layer that holds one of them should hold
+/// the other. What stays here is the choice of hash by OID, which is PKINIT's fact and nobody else's.
 pub(crate) fn sp800_56a(kdf: &str, z: &[u8], other_info: &[u8], len: usize) -> Option<Vec<u8>> {
-    fn run<H: Digest>(z: &[u8], info: &[u8], len: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(len + 64);
-        let mut counter = 1u32;
-        while out.len() < len {
-            let mut h = H::new();
-            h.update(counter.to_be_bytes());
-            h.update(z);
-            h.update(info);
-            out.extend_from_slice(&h.finalize());
-            counter += 1;
-        }
-        out.truncate(len);
-        out
-    }
-    match kdf {
-        KDF_SHA1 => Some(run::<Sha1>(z, other_info, len)),
-        KDF_SHA256 => Some(run::<Sha256>(z, other_info, len)),
-        KDF_SHA512 => Some(run::<Sha512>(z, other_info, len)),
-        _ => None,
-    }
+    let kind = match kdf {
+        KDF_SHA1 => KdfHash::Sha1,
+        KDF_SHA256 => KdfHash::Sha256,
+        KDF_SHA512 => KdfHash::Sha512,
+        _ => return None,
+    };
+    Some(rrl_crypto::sp_800_56a(kind, z, other_info, len))
 }
 
 #[cfg(test)]
