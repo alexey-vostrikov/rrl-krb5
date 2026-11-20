@@ -324,14 +324,9 @@ mod sealed {
 /// loop must run to the end regardless. The length test above it is not a
 /// leak: token lengths are public.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    core::hint::black_box(diff) == 0
+    // RRL-7.2: the comparison lives in the crypto layer, where the `black_box` that keeps an
+    // optimiser from reintroducing the early exit is written once.
+    rrl_crypto::ct_eq(a, b)
 }
 
 // ---------------------------------------------------------------------------

@@ -546,16 +546,10 @@ fn hmac(hash: Hash, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
 /// The length comparison is not secret — tag lengths are fixed by the enctype
 /// and public on the wire.
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    // black_box so the accumulate-then-test cannot be rewritten into an
-    // early-exit loop by a future optimiser.
-    std::hint::black_box(diff) == 0
+    // One implementation for the family (RRL-7.2): a comparison written four times is four chances
+    // to write the version that exits early, and two of the four copies here disagreed about
+    // `black_box`. `rrl-crypto` keeps the one that has it.
+    rrl_crypto::ct_eq(a, b)
 }
 
 // ---------------------------------------------------------------------------

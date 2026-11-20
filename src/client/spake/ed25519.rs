@@ -160,8 +160,9 @@ impl Fe {
     }
 
     fn ct_eq(self, o: Fe) -> bool {
-        let (a, b) = (self.to_bytes(), o.to_bytes());
-        a.iter().zip(&b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+        // RRL-7.2: the same field comparison, through the family's one constant-time compare. It
+        // reads two encodings of equal length, which is exactly the case that function is for.
+        rrl_crypto::ct_eq(&self.to_bytes(), &o.to_bytes())
     }
 
     fn is_negative(self) -> bool {
