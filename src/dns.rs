@@ -960,9 +960,18 @@ mod tests {
     }
 
     fn fake(zone: HashMap<(String, u16), Says>) -> Fake {
-        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let addr = udp.local_addr().unwrap();
-        let tcp = TcpListener::bind(addr).unwrap();
+        // UDP and TCP number their ports separately, so a port that was free for the datagram
+        // socket can already be held by somebody else's TCP listener - the two binds are
+        // independent bets, and losing the second one says "busy port", not "broken parser".
+        // It surfaced as `AddrInUse` only when several instrumented runs shared the machine.
+        let (udp, tcp, addr) = (0..64)
+            .find_map(|_| {
+                let udp = UdpSocket::bind("127.0.0.1:0").ok()?;
+                let addr = udp.local_addr().ok()?;
+                let tcp = TcpListener::bind(addr).ok()?;
+                Some((udp, tcp, addr))
+            })
+            .expect("no port free for both UDP and TCP after 64 attempts");
         let asked = Arc::new(Mutex::new(Vec::new()));
         let zone = Arc::new(zone);
         let (a, z) = (asked.clone(), zone.clone());
