@@ -64,6 +64,29 @@ coverage() {
     }
 }
 
+# The three measurements ub-mode asks for, and they are not interchangeable: CRAP says what to
+# split or cover, dupes say what to delete, mutants say whether the tests can tell right from
+# wrong. A crate can be green on one and hopeless on another - rrl-crypto sits at 5% of functions
+# over the CRAP threshold while carrying a checksum function copied twice.
+dupes() {
+    # No coverage, no build: AST comparison only, so this is the cheap one and the one worth
+    # running often. 0.8 is cargo-dupes' default and the methodology's threshold.
+    in_image 'cargo dupes report --threshold 0.8 || true'
+}
+
+mutants() {
+    # Scope is the only lever that scales: a crate has thousands of mutants and a full run costs a
+    # day, so files are named explicitly. `-j 1` because every worker shares one CARGO_TARGET_DIR
+    # and parallel workers turn into build timeouts rather than verdicts; `--timeout` because a
+    # mutant that removes a loop's exit condition hangs the run forever, and a hang looks exactly
+    # like a slow file in the log. `--test-tool`/`--test-command` here is a plain `cargo test`:
+    # a wrapper that mounts the repo would build the unmutated file and everything would "die".
+    #
+    #   ./scripts/metrics.sh mutants src/kdf.rs
+    shift
+    in_image "cargo mutants --jobs 1 --timeout 180 --file ${*:-.} || true"
+}
+
 case "${1:-all}" in
 coverage)
     coverage
@@ -74,13 +97,20 @@ crap)
     # the report. The gate, if one is wanted, is decided on the numbers and not on this exit code.
     in_image 'cargo crap --lcov /coverage/lcov.info --threshold 10 || true'
     ;;
+dupes)
+    dupes
+    ;;
+mutants)
+    mutants "$@"
+    ;;
 all)
     coverage
     in_image 'cargo crap --lcov /coverage/lcov.info --threshold 10 || true'
+    dupes
     ;;
 *)
     echo "unknown measurement: $1" >&2
-    echo "one of: coverage crap all" >&2
+    echo "one of: coverage crap dupes mutants all" >&2
     exit 2
     ;;
 esac
