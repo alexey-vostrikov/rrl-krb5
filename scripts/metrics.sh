@@ -43,15 +43,23 @@ in_image() {
 
 # `--no-cfg-coverage`: the cfg-coverage remapping needs a nightly component and the numbers it moves
 # are not the ones a CRAP threshold is decided on.
+#
+# `--summary-only` must NOT appear on the invocation that writes the LCOV. It does not merely hide
+# the per-file table: it drops the `DA:` records, leaving `LF`/`LH` totals. Line coverage still
+# reads correctly from those totals, so the percentage looks right - and CRAP, which needs
+# per-line data to score a function, sees no coverage at all and prints 0.0% for every function at
+# once. That is the signature the methodology warns about, and it was produced here by this flag.
+# The table comes from `report` over the same profraw instead, which costs no second test run.
 coverage() {
-    # The failure path matters as much as the success one. The first version of this script blamed
-    # `UB_FEATURES` for every failure, and the run that actually failed was a test that binds a
-    # port - so the message pointed at a feature flag that was fine. Say only what is known.
     in_image "cargo llvm-cov $features --lcov --output-path /coverage/lcov.info \
-        --no-cfg-coverage --summary-only" || {
+        --no-cfg-coverage" || {
         echo "coverage failed: no LCOV was written, so there is nothing to measure." >&2
         echo "  'test result: FAILED' above means a test broke under instrumentation;" >&2
         echo "  a feature or compile error names itself." >&2
+        exit 1
+    }
+    in_image "cargo llvm-cov report --summary-only" || {
+        echo "the LCOV was written, but the summary could not be rendered" >&2
         exit 1
     }
 }
