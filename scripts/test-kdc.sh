@@ -50,6 +50,14 @@ FREALM=FAR.TEST
 HOST=${KRB5_TEST_HOST:-127.0.0.1}
 PATH=$PATH:/usr/sbin:/usr/local/sbin
 
+# The principal `kadmin.local` names itself when it runs a query.
+#
+# Not cosmetic: without `-p` it derives the name from the current user through `getpwuid`, and in a
+# container the process usually runs as a bare uid with no passwd entry. It then fails every query
+# with `unable to figure out a principal name` — which reads like a broken realm, not like a missing
+# `/etc/passwd` line. Asking for it explicitly costs nothing on a normal host.
+KADMIN_PRINCIPAL="admin/admin@$REALM"
+
 if [ -f "$DIR/kdc.pid" ]; then kill $(cat "$DIR/kdc.pid") 2>/dev/null || true; fi
 rm -rf "${DIR:?}"/*
 
@@ -344,7 +352,10 @@ done
 kr() {
     local out realm=$1
     shift
-    out=$(kadmin.local -r "$realm" -q "$*" 2>&1)
+    # `-p` for the reason given at KADMIN_PRINCIPAL; the greeting it prints is dropped so that a
+    # caller comparing the output with empty does not read it as a message about the query.
+    out=$(kadmin.local -r "$realm" -p "admin/admin@$realm" -q "$*" 2>&1 \
+        | sed -e '/^Authenticating as /d')
     if grep -qiE 'error|cannot|failed|usage' <<<"$out"; then
         echo "kadmin.local -r $realm -q '$*' failed:" >&2; echo "$out" >&2; exit 1
     fi
@@ -383,7 +394,8 @@ k ktadd -k "$DIR/service.keytab" s4u/svc.krb5.test
 # A user whose KDC wants a one-time password (checked by RADIUS).
 if [ -n "$OTP" ]; then
     k addprinc -pw otpuserpw +requires_preauth otpuser
-    out=$(kadmin.local -r "$REALM" setstr otpuser otp '[{"type": "radius"}]' 2>&1)
+    out=$(kadmin.local -r "$REALM" -p "$KADMIN_PRINCIPAL" setstr otpuser otp '[{"type": "radius"}]' 2>&1 \
+        | sed -e '/^Authenticating as /d')
     if [ -n "$out" ]; then echo "setstr otp: $out" >&2; exit 1; fi
 fi
 # The realm's krbtgt key, for checking the KDC's PAC signatures.
