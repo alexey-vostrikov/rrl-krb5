@@ -3475,4 +3475,53 @@ mod tests {
             assert_eq!(*log.lock().unwrap(), ["tcp", "udp"]);
         }
     }
+
+    /// The codes RFC 4120 §7.5.9 gives a name, and the name it gives. The table is what an operator
+    /// reads in a log line and what the error's `Display` prints, so a wrong number or a misspelt
+    /// name is a defect in the one place a failure is explained — and a match arm no test enters is
+    /// a branch nobody has looked at since it was written.
+    ///
+    /// The list is written out rather than derived from the function: a test that walks the table
+    /// with the table proves only that the table equals itself. The names were checked against the
+    /// RFCs (4120 §7.5.9, 4556 §3.2.2) and against MIT's `krb5.h`, which agree on every one of them;
+    /// where the C identifier and the RFC name differ, the RFC name wins, because it is the one a
+    /// reader of the log has: 23 is `KDC_ERR_KEY_EXPIRED`, not MIT's `KRB5KDC_ERR_KEY_EXP`.
+    #[test]
+    fn every_named_kdc_error_maps_to_the_name_rfc_4120_gives_it() {
+        const NAMED: &[(i32, &str)] = &[
+            (6, "KDC_ERR_C_PRINCIPAL_UNKNOWN"),
+            (7, "KDC_ERR_S_PRINCIPAL_UNKNOWN"),
+            (12, "KDC_ERR_POLICY"),
+            (14, "KDC_ERR_ETYPE_NOSUPP"),
+            (18, "KDC_ERR_CLIENT_REVOKED"),
+            (23, "KDC_ERR_KEY_EXPIRED"),
+            (24, "KDC_ERR_PREAUTH_FAILED"),
+            (25, "KDC_ERR_PREAUTH_REQUIRED"),
+            (31, "KRB_AP_ERR_BAD_INTEGRITY"),
+            (32, "KRB_AP_ERR_TKT_EXPIRED"),
+            (34, "KRB_AP_ERR_REPEAT"),
+            (37, "KRB_AP_ERR_SKEW"),
+            (41, "KRB_AP_ERR_MODIFIED"),
+            (60, "KRB_ERR_GENERIC"),
+            (62, "KDC_ERR_CLIENT_NOT_TRUSTED"),
+            (63, "KDC_ERR_KDC_NOT_TRUSTED"),
+            (64, "KDC_ERR_INVALID_SIG"),
+            (65, "KDC_ERR_DH_KEY_PARAMETERS_NOT_ACCEPTED"),
+            (68, "KDC_ERR_WRONG_REALM"),
+            (70, "KDC_ERR_CANT_VERIFY_CERTIFICATE"),
+            (71, "KDC_ERR_INVALID_CERTIFICATE"),
+            (72, "KDC_ERR_REVOKED_CERTIFICATE"),
+            (75, "KDC_ERR_CLIENT_NAME_MISMATCH"),
+            (76, "KDC_ERR_KDC_NAME_MISMATCH"),
+            (77, "KDC_ERR_INCONSISTENT_KEY_PURPOSE"),
+        ];
+        for (code, name) in NAMED {
+            assert_eq!(kdc_error_name(*code), *name, "code {code}");
+        }
+        // A code outside the table is not given a name it does not have: an unrecognised error has
+        // to read as unknown rather than as the nearest one in the table.
+        for code in [0, 1, 5, 8, 13, 30, 33, 42, 61, 73, 78, 99, -1] {
+            assert_eq!(kdc_error_name(code), "unknown", "code {code}");
+        }
+    }
 }
