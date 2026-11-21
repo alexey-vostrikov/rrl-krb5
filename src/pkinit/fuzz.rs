@@ -37,7 +37,7 @@ pub fn input(data: &[u8]) {
                 let _ = c.public_key();
                 let _ = c.key_usage(0);
                 let _ = c.has_eku("1.3.6.1.5.2.3.5");
-                let _ = c.san();
+                let _ = c.kerberos_alt_names();
                 let _ = x509::verify_chain(&c, &[], std::slice::from_ref(&c), 1_700_000_000);
             }
             let _ = x509::parse_certs(d);

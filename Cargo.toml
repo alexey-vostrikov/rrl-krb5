@@ -43,7 +43,7 @@ rrl-krb-common = { git = "https://github.com/alexey-vostrikov/rrl-krb-common", b
 [features]
 # PKINIT (RFC 4556), anonymous PKINIT (RFC 8062) and ECDH/ECDSA (RFC 5349):
 # `krb5::pkinit`.
-pkinit = ["spake-nist", "dep:crypto-bigint", "dep:des", "dep:rc2", "dep:pbkdf2"]
+pkinit = ["spake-nist", "rrl-crypto/pkcs"]
 # SPAKE pre-authentication over the NIST curves P-256, P-384 and P-521
 # (edwards25519, MIT's default, needs no feature).
 spake-nist = ["dep:p256", "dep:p384", "dep:p521"]
@@ -58,7 +58,11 @@ rustdoc-args = ["--cfg", "docsrs"]
 [dev-dependencies]
 # The differential test in `src/differential.rs` runs every crypto function of this crate and of
 # `rrl-crypto` on the same inputs and compares the octets.
-rrl-crypto = { git = "https://github.com/alexey-vostrikov/rrl-crypto", branch = "main" }
+#
+# `test-support` brings the certificate and CMS fixtures the PKINIT scenarios are built from: they
+# live beside the parser that reads them (RRL-7.8), so this crate's tests borrow them rather than
+# keeping a second copy that could drift from the format.
+rrl-crypto = { git = "https://github.com/alexey-vostrikov/rrl-crypto", branch = "main", features = ["test-support", "pkcs"] }
 pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
 serde_json = "1.0"
 tokio = { version = "1.38", default-features = false, features = ["rt", "rt-multi-thread", "macros", "net", "time", "io-util"] }

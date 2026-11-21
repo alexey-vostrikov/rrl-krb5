@@ -7,7 +7,7 @@ use crate::client::Principal;
 use crate::der;
 use rrl_crypto::KdfHash;
 use sha1::Sha1;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::Digest;
 
 /// `id-pkinit-kdf-ah-sha1`, `-sha256`, `-sha512` (RFC 8636 §8).
 pub(crate) const KDF_SHA1: &str = "1.3.6.1.5.2.3.6.1";

@@ -34,18 +34,15 @@
 //! also refuses), PKCS #11 identities (smart cards), and OCSP (nor does
 //! MIT do it).
 
-mod asn1;
-mod bigint;
-mod cms;
-mod crl;
+// The ASN.1 envelopes — certificates, CRLs, CMS and PKCS#12 — live in `rrl_crypto::pkcs` since
+// RRL-7.8: they are RFC 5280/5652/7292 structures, not Kerberos ones, and the octets they produce
+// are what a signature covers. Re-exported so that `pkinit::x509::Cert` and the rest keep resolving
+// here; what stays is what actually knows about a realm — the DH and ECDH exchange, the KDF, and
+// the principal decode in `san`.
+pub(crate) use rrl_crypto::pkcs::{asn1, bigint, cms, crl, ec, keys, pem, pkcs12, rsa, x509};
 mod dh;
-mod ec;
 mod kdf;
-mod keys;
-pub(crate) mod pem;
-mod pkcs12;
-mod rsa;
-mod x509;
+mod san;
 
 use crate::client::{ClientError, Principal, Result, decode_encrypted_data, decode_key};
 use crate::config::Krb5Conf;
@@ -495,7 +492,7 @@ impl Identity {
     /// subjectAltName: the names the KDC will accept it for (unless the
     /// KDC maps certificates to principals some other way).
     pub fn principals(&self) -> Vec<Principal> {
-        self.certs[0].san().map(|(p, _)| p).unwrap_or_default()
+        san::san(&self.certs[0]).map(|(p, _)| p).unwrap_or_default()
     }
 }
 
@@ -911,7 +908,7 @@ impl Request {
 /// and the digitalSignature key usage.
 fn check_kdc_certificate(cert: &x509::Cert, realm: &str, hostnames: &[String]) -> Result<()> {
     let bad = |e: der::DerError| ClientError::Pkinit(format!("KDC certificate: {}", e.0));
-    let (principals, dns) = cert.san().map_err(bad)?;
+    let (principals, dns) = san::san(cert).map_err(bad)?;
     let tgs = Principal::krbtgt(realm);
     if principals
         .iter()
@@ -1024,8 +1021,7 @@ mod tests {
         .content;
         // Absolute, and the directory is created: `target/` exists only when cargo was allowed to
         // build in-tree, and under `CARGO_TARGET_DIR` it does not.
-        let out = std::env::var("AUTHPACK_OUT")
-            .unwrap_or_else(|_| "authpack.der".to_string());
+        let out = std::env::var("AUTHPACK_OUT").unwrap_or_else(|_| "authpack.der".to_string());
         std::fs::write(&out, &ap).unwrap();
         eprintln!("authpack written to {out}");
     }
