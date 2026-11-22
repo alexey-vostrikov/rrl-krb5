@@ -1,0 +1,5 @@
+# The `cargo fuzz` entry points are not shipped code and are not meant to be covered: a target is
+# driven by a corpus, its coverage says nothing about the crate, and it never runs in the test suite.
+# Left in, they take seven of the top rows of the CRAP report with 0% coverage at complexity 13-18,
+# which buries the functions a maintainer is supposed to look at.
+exclude = ["**/fuzz.rs", "**/*_fuzz.rs"]
