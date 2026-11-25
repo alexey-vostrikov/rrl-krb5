@@ -121,15 +121,20 @@ mod tests {
         assert!(ticket_server(&der::cons(app(1), &[der::seq(&[])])).is_none());
     }
 
-    /// The check that runs before any network call, and the reason it exists: a server's TGT for
-    /// another realm names a `krbtgt` that is not this realm's, so a ticket encrypted in its session
-    /// key could not be accepted here. Refused by name rather than sent to the KDC to fail there.
-    #[test]
-    fn a_server_tgt_for_another_realm_is_refused_before_the_request() {
-        let client = KdcClient::new("AD.EXAMPLE.COM", ["kdc.ad.example.com"]);
-        let tgt = Credentials {
-            client: Principal::parse("user@AD.EXAMPLE.COM").unwrap(),
-            server: Principal::krbtgt("AD.EXAMPLE.COM"),
+    /// The client's own TGT for `realm`, which every refusal below is made through.
+    ///
+    /// The KDC address does not resolve, and that is deliberate: each of these tests has to show
+    /// that the decision was made *before* the request. If one of them gets as far as the network,
+    /// the error says so and the assertion that names the refusal fails.
+    fn client(realm: &str) -> KdcClient {
+        KdcClient::new(realm, ["kdc.invalid"])
+    }
+
+    /// The client's TGT as a value: the exchange reads its server and session key, not its tickets.
+    fn own_tgt(realm: &str) -> Credentials {
+        Credentials {
+            client: Principal::parse(&format!("user@{realm}")).unwrap(),
+            server: Principal::krbtgt(realm),
             session_key: Key::new(18, vec![3; 32]).unwrap(),
             ticket: vec![],
             ticket_enctype: 18,
@@ -138,13 +143,25 @@ mod tests {
             starttime: None,
             endtime: 0,
             renew_till: None,
-        };
+        }
+    }
+
+    /// The check that runs before any network call, and the reason it exists: a server's TGT for
+    /// another realm names a `krbtgt` that is not this realm's, so a ticket encrypted in its session
+    /// key could not be accepted here. Refused by name rather than sent to the KDC to fail there.
+    ///
+    /// The server's own realm is this one; only its TGT is foreign. Isolating the two clauses this
+    /// way is what makes the test able to see the `||` between them being turned into `&&`: with
+    /// both clauses true a mutated condition still refuses, and the test would pass for the wrong
+    /// reason.
+    #[test]
+    fn a_server_tgt_for_another_realm_is_refused_before_the_request() {
         let elsewhere = ticket("OTHER.EXAMPLE.NET", &["krbtgt", "OTHER.EXAMPLE.NET"]);
 
-        let error = block_on(client.user_to_user_on(
+        let error = block_on(client("AD.EXAMPLE.COM").user_to_user_on(
             &Blocking,
-            &tgt,
-            &Principal::parse("host@srv.ad.example.com").unwrap(),
+            &own_tgt("AD.EXAMPLE.COM"),
+            &Principal::parse("host@AD.EXAMPLE.COM").unwrap(),
             &elsewhere,
         ))
         .expect_err("a TGT for another realm cannot carry this exchange");
@@ -156,6 +173,50 @@ mod tests {
         assert!(
             text.contains("OTHER.EXAMPLE.NET"),
             "the reason names the realm: {text}"
+        );
+    }
+
+    /// The other clause, isolated: the server's TGT is this realm's, and the server asked for is in
+    /// another realm. Refused for the same reason, and the second half of the condition is what
+    /// says so.
+    #[test]
+    fn a_server_in_another_realm_is_refused_before_the_request() {
+        let ours = ticket("AD.EXAMPLE.COM", &["krbtgt", "AD.EXAMPLE.COM"]);
+
+        let error = block_on(client("AD.EXAMPLE.COM").user_to_user_on(
+            &Blocking,
+            &own_tgt("AD.EXAMPLE.COM"),
+            &Principal::parse("host@OTHER.EXAMPLE.NET").unwrap(),
+            &ours,
+        ))
+        .expect_err("a server in another realm cannot be reached through this TGT");
+        assert!(
+            error
+                .to_string()
+                .contains("cross-realm user-to-user is not supported"),
+            "{error}"
+        );
+    }
+
+    /// With both sides in one realm the check lets the exchange through, and this is the test that
+    /// says so: it must reach the network, where the unresolvable KDC is the failure. A condition
+    /// that refused unconditionally - the shape a deleted `!` or an inverted `!=` produces - would
+    /// answer here with the cross-realm message instead, and the assertion below would see it.
+    #[test]
+    fn a_matching_tgt_and_realm_are_not_refused_by_the_check() {
+        let ours = ticket("AD.EXAMPLE.COM", &["krbtgt", "AD.EXAMPLE.COM"]);
+
+        let error = block_on(client("AD.EXAMPLE.COM").user_to_user_on(
+            &Blocking,
+            &own_tgt("AD.EXAMPLE.COM"),
+            &Principal::parse("host@AD.EXAMPLE.COM").unwrap(),
+            &ours,
+        ))
+        .expect_err("the KDC address does not resolve, so the exchange cannot finish");
+        let text = error.to_string();
+        assert!(
+            !text.contains("cross-realm"),
+            "the exchange was refused by the realm check, which should have let it through: {text}"
         );
     }
 
