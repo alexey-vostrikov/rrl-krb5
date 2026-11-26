@@ -1,5 +1,6 @@
 target/
 Cargo.lock
 .metrics/
-mutants.out
-mutants.out.old
+# cargo-mutants writes its report here; the next run rotates the previous to `mutants.out.old`
+# instead of deleting it, so the pattern covers both.
+/mutants.out*
